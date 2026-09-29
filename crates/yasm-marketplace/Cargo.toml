@@ -1,0 +1,19 @@
+[package]
+name = "yasm-marketplace"
+version = "0.0.1"
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+clap.workspace = true
+etcetera.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+toml_edit.workspace = true
+yasm-core.workspace = true
+yasm-providers.workspace = true

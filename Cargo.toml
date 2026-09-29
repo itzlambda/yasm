@@ -1,0 +1,66 @@
+[workspace]
+members = [
+    "crates/yasm-cli",
+    "crates/yasm-core",
+    "crates/yasm-marketplace",
+    "crates/yasm-providers",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+repository = "https://github.com/itzlambda/yasm"
+
+[workspace.dependencies]
+# CLI-level error propagation and context; reuse for command orchestration errors.
+anyhow = "1"
+# UTF-8 path types shared across crates and serialized data models.
+camino = { version = "1", features = ["serde1"] }
+# Typed CLI parsing, validation, generated help, and shell-facing errors.
+clap = { version = "4", features = ["derive"] }
+# Interactive TTY confirmations, selections, and multi-selections.
+dialoguer = "0.11"
+# Cross-platform home, config, cache, and data directory discovery.
+etcetera = "0.11"
+# Test-only pseudo-terminal driver for exercising interactive CLI flows.
+expectrl = "0.9"
+# TTY-aware progress spinners and status messages.
+indicatif = "0.18.4"
+# Safe platform filesystem operations not exposed by std, including atomic renames.
+rustix = { version = "1", features = ["fs"] }
+# In-place upgrades of the yasm binary from GitHub releases.
+# ureq + rustls uses ring instead of aws-lc so musl release builds stay static.
+self_update = { version = "1.3", default-features = false, features = ["ureq", "rustls", "progress-bar", "github", "checksums"] }
+# Serialization derives for lockfiles, journals, status, and metadata models.
+serde = { version = "1", features = ["derive"] }
+# JSON lockfile, journal, test fixture, and machine-readable output support.
+serde_json = "1"
+# SHA-256 digests for skill trees and embedded bundles.
+sha2 = "0.10"
+# YAML parsing for SKILL.md frontmatter and agent metadata files.
+serde_yaml = "0.9"
+# Unified and inline text diffs for review flows.
+similar = { version = "3.1.1", features = ["inline"] }
+# Human-readable tables for skill listings.
+tabled = { version = "0.15", default-features = true, features = ["ansi"] }
+# Secure temporary files and directories for staging, atomic writes, and tests.
+tempfile = "3"
+# Derived typed errors and source chains in yasm-core.
+thiserror = "2"
+# TOML parsing and structure-preserving edits for Codex MCP configuration.
+toml_edit = { version = "0.22", features = ["serde"] }
+# Terminal width detection for readable diff wrapping.
+terminal_size = "0.4.4"
+# Unicode display-column measurement for terminal layout and wrapping.
+unicode-width = "0.2"
+# Internal domain, storage, lifecycle, and metadata APIs.
+yasm-core = { path = "crates/yasm-core" }
+# Removable plugin catalog, package lifecycle, and cross-agent output support.
+yasm-marketplace = { path = "crates/yasm-marketplace" }
+# Internal source acquisition, resolution, and bundled-skill APIs.
+yasm-providers = { path = "crates/yasm-providers" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

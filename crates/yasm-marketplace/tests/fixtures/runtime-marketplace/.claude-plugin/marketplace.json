@@ -1,0 +1,10 @@
+{
+  "name": "yasm-runtime-fixtures",
+  "plugins": [
+    {
+      "name": "ping",
+      "description": "Deterministic local MCP runtime fixture",
+      "source": "./plugins/ping"
+    }
+  ]
+}

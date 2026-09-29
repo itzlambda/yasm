@@ -1,0 +1,4 @@
+{
+  "name": "yasm",
+  "install": "rustup toolchain install stable --profile minimal --no-self-update && rustup default stable && cargo fetch --locked && cargo build --workspace --locked"
+}

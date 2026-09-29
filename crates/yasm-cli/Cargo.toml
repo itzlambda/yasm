@@ -1,0 +1,35 @@
+[package]
+name = "yasm-cli"
+version = "0.0.1"
+edition.workspace = true
+repository.workspace = true
+
+[features]
+default = ["marketplace"]
+marketplace = ["dep:yasm-marketplace"]
+
+[[bin]]
+name = "yasm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+clap.workspace = true
+dialoguer.workspace = true
+indicatif.workspace = true
+rustix.workspace = true
+self_update.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+tabled.workspace = true
+tempfile.workspace = true
+terminal_size.workspace = true
+unicode-width.workspace = true
+yasm-core.workspace = true
+yasm-marketplace = { workspace = true, optional = true }
+yasm-providers.workspace = true
+
+[dev-dependencies]
+expectrl.workspace = true

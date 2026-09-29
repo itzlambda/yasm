@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            rust-targets: x86_64-unknown-linux-musl
+            build-targets: x86_64-unknown-linux-musl
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            rust-targets: aarch64-unknown-linux-musl
+            build-targets: aarch64-unknown-linux-musl
+          - name: macos
+            os: macos-15
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            build-targets: aarch64-apple-darwin x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Install musl toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Asset names are `yasm-<target>`. `yasm self-upgrade` selects that name.
+      - name: Build release binaries
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: |
+          set -eu
+          version=$(awk -F'"' '/^version = / { print $2; exit }' crates/yasm-cli/Cargo.toml)
+          target_dir="${CARGO_TARGET_DIR:-target}"
+          mkdir -p dist
+          for target in ${{ matrix.build-targets }}; do
+            case "$target" in
+              *-unknown-linux-musl)
+                # ring needs a musl C compiler; musl-gcc is the native wrapper.
+                upper=$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')
+                underscored=$(printf '%s' "$target" | tr '-' '_')
+                export "CARGO_TARGET_${upper}_LINKER=musl-gcc"
+                export "CC_${underscored}=musl-gcc"
+                ;;
+            esac
+            cargo build --release --locked -p yasm-cli --target "$target"
+            bin="${target_dir}/${target}/release/yasm"
+            actual=$("$bin" --version)
+            if [ "$actual" != "yasm $version" ]; then
+              printf 'expected version %s, got %s\n' "yasm $version" "$actual" >&2
+              exit 1
+            fi
+            case "$target" in
+              *linux*)
+                linkage=$(ldd "$bin" 2>&1 || true)
+                case "$linkage" in
+                  *"statically linked"*|*"not a dynamic executable"*) ;;
+                  *)
+                    printf 'expected a static binary for %s:\n%s\n' "$target" "$linkage" >&2
+                    exit 1
+                    ;;
+                esac
+                ;;
+            esac
+            cp "$bin" "dist/yasm-${target}"
+            chmod 755 "dist/yasm-${target}"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yasm-${{ matrix.name }}
+          path: dist/yasm-*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: yasm-*
+          merge-multiple: true
+
+      - name: Check tag version
+        id: version
+        run: |
+          set -eu
+          tag="${GITHUB_REF#refs/tags/}"
+          version="${tag#v}"
+          crate_version=$(awk -F'"' '/^version = / { print $2; exit }' crates/yasm-cli/Cargo.toml)
+          if [ "$version" != "$crate_version" ]; then
+            printf 'tag %s does not match crates/yasm-cli version %s\n' "$tag" "$crate_version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Collect release assets
+        run: |
+          set -eu
+          find dist -type f -name 'yasm-*' > binaries
+          if [ ! -s binaries ]; then
+            printf 'no release binaries found\n' >&2
+            exit 1
+          fi
+          : > dist/SHA256SUMS
+          while IFS= read -r file; do
+            hash=$(sha256sum "$file" | awk '{ print $1 }')
+            printf '%s  %s\n' "$hash" "$(basename "$file")" >> dist/SHA256SUMS
+          done < binaries
+
+      # Tags start as prereleases. Promote one in the GitHub UI after
+      # verification. A re-run of this step sets the release back to prerelease.
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          name: yasm ${{ steps.version.outputs.version }}
+          prerelease: true
+          generate_release_notes: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          working_directory: dist
+          files: |
+            **/yasm-*
+            SHA256SUMS

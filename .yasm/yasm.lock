@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "skills": {
+    "commit-pr-conventions": {
+      "name": "commit-pr-conventions",
+      "source": {
+        "kind": "owned",
+        "path": "."
+      },
+      "skill_path": "SKILL.md",
+      "digest": "7c71d7ff0fa74d755adb0b36f09f7b1c4c4441c4a228dd66800cdd4da9c285b4",
+      "enabled": [
+        "claude",
+        "universal"
+      ]
+    },
+    "issue-to-pr": {
+      "name": "issue-to-pr",
+      "source": {
+        "kind": "owned",
+        "path": "."
+      },
+      "skill_path": "SKILL.md",
+      "digest": "6e680f8cd5aeb7e7237886e0f2c1e5e16bd3371d8b8c90e424a1ba9539b6a532",
+      "enabled": [
+        "claude",
+        "universal"
+      ]
+    }
+  }
+}
