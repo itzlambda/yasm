@@ -29,65 +29,31 @@ consistent workflow:
 
 ## Installation
 
-Install the latest stable release with [scripts/install.sh](scripts/install.sh).
-A tagged build is published as a prerelease first. Mark it as a full release
-after verifying it; until then the installer and `yasm self-upgrade` leave it
-alone.
+Install the latest stable release on Linux or macOS:
 
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/itzlambda/yasm/main/scripts/install.sh | sh
+```sh
+curl -fsSL https://yasm.itzlambda.com/install | sh
 ```
 
-The script checks the release checksum and installs `yasm` to `~/.yasm/bin`.
-When a terminal is available it asks before adding that directory to your `PATH`.
-It updates the startup files of every shell it finds: `~/.profile`, `~/.bashrc`,
-`~/.zshenv`, and `~/.config/fish/conf.d/yasm.fish`. If `~/.local/bin` is already
-on your `PATH`, it also links `yasm` there so the current shell can run it
-immediately. Pass `-y` to accept the `PATH` change without a prompt:
+The installer asks before adding Yasm to your `PATH`. Follow its instructions to
+start using `yasm` in your shell. Yasm requires `git` to fetch GitHub sources.
+On Windows, use WSL with your project on the Linux filesystem.
 
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/itzlambda/yasm/main/scripts/install.sh | sh -s -- -y
-```
+To upgrade:
 
-Yasm also requires `git` on `PATH` to fetch GitHub sources.
-
-Upgrade that install from later GitHub releases with:
-
-```bash
+```sh
 yasm self-upgrade
 ```
 
-In a terminal, `yasm self-upgrade` asks before replacing the binary. Pass `--yes`
-to upgrade without a prompt. It installs the newest stable release.
+To build from source, install Rust and Cargo, then:
 
-The script installs one of these binaries:
-
-| Platform | Binary |
-| --- | --- |
-| Linux x86_64 | `yasm-x86_64-unknown-linux-musl` |
-| Linux arm64 | `yasm-aarch64-unknown-linux-musl` |
-| macOS Apple Silicon | `yasm-aarch64-apple-darwin` |
-| macOS Intel | `yasm-x86_64-apple-darwin` |
-
-Linux binaries are statically linked. macOS binaries are unsigned. The install
-script removes the download quarantine attribute. If Gatekeeper still blocks the
-first launch, open the binary from Finder. A `cargo install` build on Linux uses
-the gnu target, so `yasm self-upgrade` does not match these musl binaries.
-
-To build from source instead, install Rust and Cargo, then:
-
-```bash
+```sh
 git clone https://github.com/itzlambda/yasm.git
 cd yasm
 cargo install --path crates/yasm-cli --locked
-yasm --version
 ```
 
-Cargo installs into `~/.cargo/bin`, which also needs to be on your `PATH`.
-
-Linux and macOS are supported. On Windows, use WSL with your project on the Linux
-filesystem. Native Windows requires Git `core.symlinks=true` and permission to
-create directory symlinks.
+Make sure `~/.cargo/bin` is on your `PATH`.
 
 ## Quick start
 
