@@ -24,7 +24,7 @@ Usage:
 
 Options:
   -y, --yes           Add yasm to PATH without prompting
-  --no-modify-path    Install the binary without changing shell startup files
+  --no-modify-path    Install the binary without changing shell startup files or ~/.local/bin
   --version <version> Install this release (for example 0.0.1 or v0.0.1)
   -h, --help          Show this help
 
@@ -124,21 +124,45 @@ file_sha256() {
     fi
 }
 
-profile_file() {
-    case "${SHELL:-}" in
-        */zsh) printf '%s\n' "$HOME/.zshrc" ;;
-        */fish) printf '%s\n' "$HOME/.config/fish/config.fish" ;;
-        */bash)
-            if [ -f "$HOME/.bashrc" ]; then
-                printf '%s\n' "$HOME/.bashrc"
-            elif [ -f "$HOME/.bash_profile" ]; then
-                printf '%s\n' "$HOME/.bash_profile"
-            else
-                printf '%s\n' "$HOME/.profile"
-            fi
-            ;;
-        *) printf '%s\n' "$HOME/.profile" ;;
+# The shell that ran this script. For `curl ... | sh` that is the parent of
+# `sh`, which may differ from the login shell in $SHELL.
+current_shell() {
+    name=$(ps -o comm= -p "$PPID" 2>/dev/null || true)
+    name=${name##*/}
+    name=${name#-}
+    case "$name" in
+        bash|zsh|fish) ;;
+        *) name=${SHELL##*/} ;;
     esac
+    printf '%s\n' "$name"
+}
+
+has_shell() {
+    [ "$running_shell" = "$1" ] || [ "${SHELL##*/}" = "$1" ] || command -v "$1" >/dev/null 2>&1
+}
+
+# Startup files that should load yasm, one per line: every shell on this
+# machine gets one, not only the current shell.
+startup_files() {
+    printf '%s\n' "$HOME/.profile"
+    if [ -f "$HOME/.bashrc" ] || has_shell bash; then
+        printf '%s\n' "$HOME/.bashrc"
+    fi
+    # Login bash reads only the first of these that exists, never ~/.profile.
+    for file in .bash_profile .bash_login; do
+        if [ -f "$HOME/$file" ]; then
+            printf '%s\n' "$HOME/$file"
+            break
+        fi
+    done
+    zdot=${ZDOTDIR:-$HOME}
+    if [ -f "$zdot/.zshenv" ] || [ -f "$zdot/.zshrc" ] || has_shell zsh; then
+        printf '%s\n' "$zdot/.zshenv"
+    fi
+    fish_config=${XDG_CONFIG_HOME:-$HOME/.config}/fish
+    if [ -d "$fish_config" ] || has_shell fish; then
+        printf '%s\n' "$fish_config/conf.d/yasm.fish"
+    fi
 }
 
 write_env_files() {
@@ -203,26 +227,29 @@ source_line_for() {
     esac
 }
 
-path_contains_bin() {
-    bin_dir=$1
+path_contains() {
     case ":${PATH:-}:" in
-        *":$bin_dir:"*) return 0 ;;
+        *":$1:"*) return 0 ;;
         *) return 1 ;;
     esac
 }
 
 confirm_path_change() {
-    profile=$1
+    files=$1
     if [ "$no_modify_path" -eq 1 ]; then
         return 1
     fi
     if [ "$assume_yes" -eq 1 ]; then
         return 0
     fi
-    if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    if ! (: </dev/tty >/dev/tty) 2>/dev/null; then
         return 1
     fi
-    printf 'Add %s/bin to PATH in %s? [Y/n] ' "$yasm_install" "$profile" >/dev/tty
+    {
+        printf 'Add %s to PATH in these shell startup files?\n' "$bin_dir"
+        printf '%s\n' "$files" | sed 's/^/  /'
+        printf '[Y/n] '
+    } >/dev/tty
     if ! read -r answer </dev/tty; then
         return 1
     fi
@@ -232,30 +259,80 @@ confirm_path_change() {
     esac
 }
 
+# A script cannot change the PATH of the shell that started it, so link yasm
+# into a directory that shell already searches. Upgrades replace the link target.
+link_into_path() {
+    link_dir="$HOME/.local/bin"
+    link="$link_dir/yasm"
+    if ! path_contains "$link_dir" || [ ! -d "$link_dir" ] || [ ! -w "$link_dir" ]; then
+        return 1
+    fi
+    if [ -L "$link" ] && [ "$(readlink "$link")" = "$exe" ]; then
+        return 0
+    fi
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        return 1
+    fi
+    ln -s "$exe" "$link"
+}
+
 configure_path() {
-    bin_dir=$1
-    profile=$(profile_file)
-    line=$(source_line_for "$profile")
+    files=$(startup_files)
 
-    if path_contains_bin "$bin_dir"; then
-        say "PATH already includes $bin_dir"
+    if ! confirm_path_change "$files"; then
+        say "PATH not changed. To load yasm in new shells, add:"
+        while IFS= read -r file; do
+            say "  $(source_line_for "$file")  # to $file"
+        done <<EOF
+$files
+EOF
         return
     fi
 
-    if ! confirm_path_change "$profile"; then
-        say "Add yasm to PATH by adding this line to your shell startup file:"
-        say "  $line"
-        return
-    fi
+    changed=0
+    while IFS= read -r file; do
+        line=$(source_line_for "$file")
+        if [ -f "$file" ] && grep -qF "$line" "$file"; then
+            continue
+        fi
+        mkdir -p "$(dirname "$file")"
+        if [ -s "$file" ]; then
+            printf '\n' >>"$file"
+        fi
+        printf '%s\n' "$line" >>"$file"
+        if [ "$changed" -eq 0 ]; then
+            say "Added yasm to PATH in:"
+            changed=1
+        fi
+        say "  $file"
+    done <<EOF
+$files
+EOF
 
-    mkdir -p "$(dirname "$profile")"
-    if [ -f "$profile" ] && grep -qF "$line" "$profile"; then
-        say "PATH entry already present in $profile"
+    if path_contains "$bin_dir"; then
         return
     fi
-    printf '\n%s\n' "$line" >>"$profile"
-    say "Added yasm to PATH in $profile"
-    say "Restart your shell or run: $line"
+    if link_into_path; then
+        say "Linked $link to $exe, so yasm works in this shell now"
+        return
+    fi
+    case "$running_shell" in
+        fish) line=$(source_line_for env.fish) ;;
+        *) line=$(source_line_for env) ;;
+    esac
+    say "New shells will find yasm. To use it in this shell, run:"
+    say "  $line"
+}
+
+warn_if_shadowed() {
+    found=$(command -v yasm 2>/dev/null || true)
+    if [ -z "$found" ] || [ "$found" = "$exe" ]; then
+        return
+    fi
+    if [ -L "$found" ] && [ "$(readlink "$found")" = "$exe" ]; then
+        return
+    fi
+    say "warning: in this shell, $found runs instead of $exe"
 }
 
 main() {
@@ -325,7 +402,9 @@ main() {
         exit 1
     fi
 
-    configure_path "$bin_dir"
+    running_shell=$(current_shell)
+    configure_path
+    warn_if_shadowed
 
     if ! command -v git >/dev/null 2>&1; then
         say "git is not on PATH. Yasm needs git to fetch GitHub skill sources."

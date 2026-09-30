@@ -40,7 +40,10 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/itzlambd
 
 The script checks the release checksum and installs `yasm` to `~/.yasm/bin`.
 When a terminal is available it asks before adding that directory to your `PATH`.
-Pass `-y` to accept the `PATH` change without a prompt:
+It updates the startup files of every shell it finds: `~/.profile`, `~/.bashrc`,
+`~/.zshenv`, and `~/.config/fish/conf.d/yasm.fish`. If `~/.local/bin` is already
+on your `PATH`, it also links `yasm` there so the current shell can run it
+immediately. Pass `-y` to accept the `PATH` change without a prompt:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/itzlambda/yasm/main/scripts/install.sh | sh -s -- -y
