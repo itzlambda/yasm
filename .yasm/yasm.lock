@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "skills": {
     "commit-pr-conventions": {
       "name": "commit-pr-conventions",
@@ -8,7 +8,7 @@
         "path": "."
       },
       "skill_path": "SKILL.md",
-      "digest": "7c71d7ff0fa74d755adb0b36f09f7b1c4c4441c4a228dd66800cdd4da9c285b4",
+      "digest": "5277f17d03be6a37e151f67b9438b2f8ee6661da855d7202219cc927ea2267f5",
       "enabled": [
         "claude",
         "universal"
