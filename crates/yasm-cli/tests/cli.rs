@@ -29,7 +29,8 @@ impl DerefMut for TestCommand {
 
 fn yasm() -> TestCommand {
     let sandbox = tempdir().unwrap();
-    let root = sandbox.path();
+    // Match the child's current_dir(), which resolves aliases such as macOS /var.
+    let root = sandbox.path().canonicalize().unwrap();
     let home = root.join("home");
     let working_dir = root.join("workspace");
     let temp_dir = root.join("tmp");
@@ -569,6 +570,7 @@ fn commands_are_sandboxed_by_default() {
         .expect("sandbox working directory should have a parent");
 
     assert_ne!(first_root, second_root);
+    assert_eq!(first_root, first_root.canonicalize().unwrap());
     for name in [
         "HOME",
         "TMPDIR",
@@ -670,6 +672,15 @@ fn init_tip_is_limited_to_interactive_unscoped_git_work_trees() {
 
 fn git(root: &std::path::Path, args: &[&str]) {
     let status = Command::new("git")
+        // Fixture commits must not depend on the caller's identity or signing setup.
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .arg("-C")
         .arg(root)
         .args(args)
@@ -1558,7 +1569,14 @@ fn list_uses_source_roots_and_hides_source_after_filtering_to_owned_skills() {
     assert!(stdout.contains("Project Skills (3)"));
     assert!(stdout.contains("Source"));
     assert!(stdout.contains("~/Workspace/L/skills"));
-    assert!(stdout.contains(&outside_source.path().display().to_string()));
+    assert!(stdout.contains(
+        &outside_source
+            .path()
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string()
+    ));
     assert!(!stdout.contains("~/Workspace/L/skills/inside-skill/SKILL.md"));
     assert!(!stdout.contains("Installed"));
     assert!(stdout
