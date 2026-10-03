@@ -130,6 +130,7 @@ enum Command {
         #[command(flatten)]
         scope: ScopeArgs,
         #[arg(
+            value_parser = SourceValueParser,
             help = "`self`, local path, GitHub owner/repo shorthand, repository URL, SCP-style user@host:path, or /tree/main/<directory> URL"
         )]
         source: SourceInput,
@@ -284,6 +285,36 @@ enum Command {
         #[arg(long, help = "Replace the binary without prompting")]
         yes: bool,
     },
+}
+
+// Clap's default FromStr adapter echoes the rejected value, which may contain credentials.
+#[derive(Clone)]
+struct SourceValueParser;
+
+impl TypedValueParser for SourceValueParser {
+    type Value = SourceInput;
+
+    fn parse_ref(
+        &self,
+        command: &clap::Command,
+        _argument: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> std::result::Result<Self::Value, clap::Error> {
+        let value = value.to_str().ok_or_else(|| {
+            clap::Error::raw(
+                clap::error::ErrorKind::InvalidUtf8,
+                "source must be valid UTF-8",
+            )
+            .with_cmd(command)
+        })?;
+        value.parse().map_err(|error: yasm_core::Error| {
+            clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!("invalid source: {error}"),
+            )
+            .with_cmd(command)
+        })
+    }
 }
 
 fn agent_value_parser() -> impl TypedValueParser<Value = LinkTarget> {

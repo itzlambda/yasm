@@ -65,6 +65,35 @@ fn yasm_with_roots(data: &Path, agents: &Path) -> TestCommand {
 }
 
 #[test]
+fn rejected_source_diagnostics_do_not_echo_credentials() {
+    for source in [
+        "https://user:review-secret@github.com/team/repo",
+        "https://github.com/team/repo?token=review-secret",
+        "git:review-secret@host:repo",
+    ] {
+        let output = yasm()
+            .args([
+                "add",
+                source,
+                "--global",
+                "--no-enable",
+                "--action",
+                "apply",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let diagnostics = format!(
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!diagnostics.contains("review-secret"));
+        assert!(diagnostics.contains("invalid source:"));
+    }
+}
+
+#[test]
 fn self_bundle_installs_offline_and_reports_provenance() {
     let data = tempdir().unwrap();
     let agents = tempdir().unwrap();
