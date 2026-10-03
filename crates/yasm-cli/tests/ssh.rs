@@ -307,6 +307,137 @@ fn scp_respects_core_ssh_command_before_git_ssh() {
         .contains("configured key"));
 }
 
+#[test]
+fn scp_git_operations_respect_repository_configuration_context() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "SKILL.md",
+        "---\nname: review\ndescription: Review\n---\nbody\n",
+    );
+    sandbox.commit();
+    // The caller's unrelated repository configuration must not affect cached Git operations.
+    let caller = sandbox.root.path().join("caller");
+    std::fs::create_dir_all(&caller).unwrap();
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&caller)
+        .args(["init", "-q"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&caller)
+        .args(["config", "core.sshCommand", "missing-caller-ssh"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .arg("-C")
+        .arg(&caller)
+        .args(["config", "ssh.variant", "plink"])
+        .status()
+        .unwrap()
+        .success());
+    let output = sandbox
+        .command()
+        .current_dir(&caller)
+        .env_remove("GIT_SSH_VARIANT")
+        .args([
+            "add",
+            SOURCE,
+            "--global",
+            "--no-enable",
+            "--action",
+            "apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The first cached clone must honor destination-based conditional includes.
+    let included = sandbox.root.path().join("ssh-config");
+    let configured = format!("'{}' -i 'conditional key'", sandbox.ssh.display());
+    for (file, key, value) in [
+        (included.clone(), "core.sshCommand".to_string(), configured),
+        (
+            sandbox.root.path().join("home/.gitconfig"),
+            format!(
+                "includeIf.gitdir:{}/**.path",
+                sandbox.root.path().join("cache/sources").display()
+            ),
+            included.to_str().unwrap().to_string(),
+        ),
+    ] {
+        assert!(Command::new("git")
+            .arg("config")
+            .arg("--file")
+            .arg(file)
+            .arg(key)
+            .arg(value)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let output = sandbox
+        .command()
+        .current_dir(&caller)
+        .env("GIT_SSH", "missing-env-ssh")
+        .env_remove("GIT_SSH_VARIANT")
+        .args([
+            "update", "review", "--global", "--action", "apply", "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["failed"], serde_json::json!([]));
+    assert!(std::fs::read_to_string(sandbox.root.path().join("ssh.log"))
+        .unwrap()
+        .contains("conditional key"));
+    let checkout = std::fs::read_dir(sandbox.root.path().join("cache/sources"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join(".git").is_dir())
+        .unwrap();
+    let configured = format!("'{}' -i 'checkout key'", sandbox.ssh.display());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&checkout)
+        .args(["config", "core.sshCommand", &configured])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = sandbox
+        .command()
+        .current_dir(caller)
+        .env("GIT_SSH", "missing-env-ssh")
+        .env_remove("GIT_SSH_VARIANT")
+        .args([
+            "update", "review", "--global", "--action", "apply", "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["failed"], serde_json::json!([]));
+    assert!(std::fs::read_to_string(sandbox.root.path().join("ssh.log"))
+        .unwrap()
+        .contains("checkout key"));
+}
+
 #[cfg(feature = "marketplace")]
 #[test]
 fn scp_marketplace_and_named_and_pinned_plugins_use_the_shared_git_runner() {

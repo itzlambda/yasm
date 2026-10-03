@@ -337,16 +337,99 @@ fn run_git_output(mut command: Command, source: &SourceSpec, action: &str) -> Re
     if source.kind == SourceKind::Git {
         let remote: GitRemote = source.path.parse()?;
         if remote.transport() == GitTransport::Ssh {
+            let clone_context = clone_destination(&command)
+                .map(|destination| CloneConfigContext::prepare(destination, source))
+                .transpose()?;
             configure_ssh(&mut command, source)?;
+            if let Some(context) = clone_context {
+                context.close()?;
+            }
         }
     }
     run_command_with_timeout(command, GIT_TIMEOUT)
         .map_err(|error| command_error(error, source, action))
 }
 
+fn clone_destination(command: &Command) -> Option<&std::ffi::OsStr> {
+    let mut arguments = command.get_args();
+    while let Some(option) = arguments.next() {
+        if option == "-c" || option == "-C" {
+            arguments.next();
+        } else {
+            return (option == "clone").then(|| arguments.last()).flatten();
+        }
+    }
+    None
+}
+
+// Git clone reads destination-dependent includeIf settings after initializing .git.
+// Supply that context for our SSH preflight, then remove it before the real clone.
+struct CloneConfigContext {
+    git_dir: std::path::PathBuf,
+}
+
+impl CloneConfigContext {
+    fn prepare(destination: &std::ffi::OsStr, source: &SourceSpec) -> Result<Self> {
+        let destination = std::path::Path::new(destination);
+        std::fs::create_dir_all(destination).map_err(|error| {
+            Error::Message(format!(
+                "cannot prepare clone configuration context: {error}"
+            ))
+        })?;
+        let git_dir = destination.join(".git");
+        // Never adopt or remove metadata that we did not create.
+        std::fs::create_dir(&git_dir).map_err(|error| {
+            Error::Message(format!(
+                "cannot prepare clone configuration context: {error}"
+            ))
+        })?;
+        let context = Self { git_dir };
+        let mut init = git_command();
+        init.args(["init", "--bare", "--quiet", "--"])
+            .arg(&context.git_dir);
+        let output = run_command_with_timeout(init, GIT_TIMEOUT)
+            .map_err(|error| command_error(error, source, "git init"))?;
+        if !output.status.success() {
+            return Err(unsuccessful_git_output(&output, source, "git init"));
+        }
+        Ok(context)
+    }
+
+    fn close(self) -> Result<()> {
+        std::fs::remove_dir_all(&self.git_dir).map_err(|error| {
+            Error::Message(format!("cannot clean clone configuration context: {error}"))
+        })
+    }
+}
+
+impl Drop for CloneConfigContext {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.git_dir);
+    }
+}
+
 // Read user Git settings with the same bounded subprocess runner, without SSH setup recursion.
-fn git_setting(name: &str, source: &SourceSpec) -> Result<Option<String>> {
+fn git_setting(name: &str, source: &SourceSpec, context: &Command) -> Result<Option<String>> {
     let mut command = git_command();
+    if let Some(directory) = context.get_current_dir() {
+        command.current_dir(directory);
+    }
+    // Mirror the global options used by our Git builder before its subcommand.
+    // In particular, -C determines local config and includeIf gitdir matching.
+    let mut arguments = context.get_args();
+    while let Some(option) = arguments.next() {
+        if option != "-C" && option != "-c" {
+            break;
+        }
+        if let Some(value) = arguments.next() {
+            command.arg(option).arg(value);
+        }
+    }
+    if let Some(destination) = clone_destination(context) {
+        command
+            .arg("--git-dir")
+            .arg(std::path::Path::new(destination).join(".git"));
+    }
     command.args(["config", "--get", name]);
     let output = run_command_with_timeout(command, GIT_TIMEOUT)
         .map_err(|error| command_error(error, source, "git config"))?;
@@ -362,7 +445,7 @@ fn git_setting(name: &str, source: &SourceSpec) -> Result<Option<String>> {
 fn configure_ssh(command: &mut Command, source: &SourceSpec) -> Result<()> {
     let variant = match std::env::var("GIT_SSH_VARIANT") {
         Ok(variant) => Some(variant),
-        Err(_) => git_setting("ssh.variant", source)?,
+        Err(_) => git_setting("ssh.variant", source, command)?,
     };
     if variant
         .as_deref()
@@ -372,7 +455,7 @@ fn configure_ssh(command: &mut Command, source: &SourceSpec) -> Result<()> {
     }
     let words = if let Ok(configured) = std::env::var("GIT_SSH_COMMAND") {
         parse_ssh_command(&configured)?
-    } else if let Some(configured) = git_setting("core.sshCommand", source)? {
+    } else if let Some(configured) = git_setting("core.sshCommand", source, command)? {
         parse_ssh_command(&configured)?
     } else if let Ok(executable) = std::env::var("GIT_SSH") {
         vec![executable]
