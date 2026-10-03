@@ -361,7 +361,7 @@ mod cache_tests {
         drop(first);
         assert!(fetch_source_cached(&source, &cache).is_err());
         drop(reader);
-        assert!(fetch_source_cached(&source, &cache).is_ok());
+        fetch_source_cached(&source, &cache).unwrap();
     }
 
     #[test]

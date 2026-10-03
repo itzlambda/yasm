@@ -17,7 +17,18 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Keep a managed checkout locked while callers inspect or copy its contents.
 #[derive(Debug, Clone)]
 pub struct CheckoutLease {
-    _file: Arc<File>,
+    _file: Arc<LockedCheckout>,
+}
+
+#[derive(Debug)]
+struct LockedCheckout(File);
+
+impl Drop for LockedCheckout {
+    fn drop(&mut self) {
+        // Explicitly release the lock even if a concurrent fork temporarily inherited
+        // this open file description before closing it during exec.
+        let _ = self.0.unlock();
+    }
 }
 
 fn checkout_lease(cache_dir: &Utf8Path, key: &str) -> Result<CheckoutLease> {
@@ -33,8 +44,31 @@ fn checkout_lease(cache_dir: &Utf8Path, key: &str) -> Result<CheckoutLease> {
         "cannot lock Git checkout cache; another Yasm command may be using it; retry after that command finishes: {error}"
     )))?;
     Ok(CheckoutLease {
-        _file: Arc::new(file),
+        _file: Arc::new(LockedCheckout(file)),
     })
+}
+
+#[cfg(all(test, unix))]
+mod checkout_lease_tests {
+    use super::*;
+
+    #[test]
+    fn final_reader_unlocks_even_while_an_inherited_descriptor_remains_open() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = Utf8Path::from_path(temporary.path()).unwrap();
+        let lease = checkout_lease(cache, "checkout").unwrap();
+        // try_clone shares the same open file description as a fork-inherited fd.
+        let inherited = lease._file.0.try_clone().unwrap();
+        let reader = lease.clone();
+        drop(lease);
+        assert!(checkout_lease(cache, "checkout").is_err());
+        drop(reader);
+        let next = checkout_lease(cache, "checkout").unwrap();
+        drop(inherited);
+        assert!(checkout_lease(cache, "checkout").is_err());
+        drop(next);
+        checkout_lease(cache, "checkout").unwrap();
+    }
 }
 
 fn managed_checkout_exists(destination: &Utf8Path) -> Result<bool> {
