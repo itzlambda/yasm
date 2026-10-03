@@ -66,6 +66,35 @@ fn yasm_with_roots(data: &Path, agents: &Path) -> TestCommand {
 }
 
 #[test]
+fn rejected_source_diagnostics_do_not_echo_credentials() {
+    for source in [
+        "https://user:review-secret@github.com/team/repo",
+        "https://github.com/team/repo?token=review-secret",
+        "git:review-secret@host:repo",
+    ] {
+        let output = yasm()
+            .args([
+                "add",
+                source,
+                "--global",
+                "--no-enable",
+                "--action",
+                "apply",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let diagnostics = format!(
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!diagnostics.contains("review-secret"));
+        assert!(diagnostics.contains("invalid source:"));
+    }
+}
+
+#[test]
 fn self_bundle_installs_offline_and_reports_provenance() {
     let data = tempdir().unwrap();
     let agents = tempdir().unwrap();
@@ -1056,7 +1085,7 @@ fn github_tree_url_reports_when_its_directory_has_no_skill() {
 
     assert!(!add.status.success());
     let stderr = String::from_utf8_lossy(&add.stderr);
-    assert!(stderr.contains("no valid skills found in GitHub directory `docs`"));
+    assert!(stderr.contains("no valid skills found in Git directory `docs`"));
 }
 
 #[test]
@@ -6639,11 +6668,11 @@ fn interactive_stage_two_failure_preserves_completed_upstream_batch() {
     session.send("\x1b[B").unwrap();
     session.send_line("").unwrap();
     session
-        .expect("Choose a skill to give a GitHub source")
+        .expect("Choose a skill to give a Git source")
         .unwrap();
     session.send_line("").unwrap();
     session
-        .expect("GitHub repository or skill-directory URL")
+        .expect("Git repository address or GitHub skill-directory URL")
         .unwrap();
     session.send_line("owner/repo").unwrap();
     session.expect(Eof).unwrap();

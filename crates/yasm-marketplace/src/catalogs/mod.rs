@@ -139,13 +139,12 @@ fn parse_source(value: &Value) -> Result<PluginSource> {
                 .and_then(Value::as_str)
                 .context("Git source requires `url`")?
                 .to_string();
-            if !url.contains("://") && url.split('/').count() == 2 {
+            if !url.contains("://") && !url.contains(':') && url.split('/').count() == 2 {
                 url = format!("https://github.com/{url}.git");
             }
-            if !url.starts_with("https://github.com/") {
-                let displayed = crate::secrets::redact_credential_urls_in_text(&url);
-                bail!("unsupported Git source URL `{displayed}`; only HTTPS GitHub repositories are supported");
-            }
+            url = url.parse::<yasm_providers::git::GitRemote>()
+                .map_err(|_| anyhow::anyhow!("unsupported Git source URL; use a GitHub HTTPS repository URL or SCP-style user@host:path"))?
+                .as_str().to_string();
             let path = object
                 .get("path")
                 .and_then(Value::as_str)
@@ -205,7 +204,7 @@ fn validate_relative(path: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::catalogs::*;
 
     #[test]
     fn parses_string_and_git_subdir_sources() {
@@ -292,5 +291,20 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("top-secret"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod ssh_tests {
+    use crate::catalogs::parse_source;
+    use crate::model::PluginSource;
+
+    #[test]
+    fn scp_source_is_not_expanded_as_github_shorthand() {
+        let address = "git@work-alias:team/repo.git";
+        let source = parse_source(&serde_json::json!({"source": "git-subdir", "url": address, "path": "plugin", "ref": "release", "sha": "0123456789abcdef0123456789abcdef01234567"})).unwrap();
+        assert!(
+            matches!(source, PluginSource::Git { url, path: Some(path), r#ref: Some(reference), sha: Some(_)} if url == address && path == "plugin" && reference == "release")
+        );
     }
 }

@@ -27,10 +27,12 @@ expectrl = "0.9"
 # TTY-aware progress spinners and status messages.
 indicatif = "0.18.4"
 # Safe platform filesystem operations not exposed by std, including atomic renames.
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 # In-place upgrades of the yasm binary from GitHub releases.
 # ureq + rustls uses ring instead of aws-lc so musl release builds stay static.
 self_update = { version = "1.3", default-features = false, features = ["ureq", "rustls", "progress-bar", "github", "checksums"] }
+# Parse and quote configured OpenSSH commands without interpreting shell expressions.
+shlex = "2"
 # Serialization derives for lockfiles, journals, status, and metadata models.
 serde = { version = "1", features = ["derive"] }
 # JSON lockfile, journal, test fixture, and machine-readable output support.

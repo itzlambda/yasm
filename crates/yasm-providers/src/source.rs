@@ -3,9 +3,12 @@ use std::str::FromStr;
 use camino::Utf8PathBuf;
 use yasm_core::{Error, GitRef, Result, SourceKind, SourceSpec};
 
+use crate::git::{valid_repo_part, GitRemote};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceInput {
     Bundled,
+    Git(GitRemote),
     Local(Utf8PathBuf),
     GitHubShorthand {
         owner: String,
@@ -27,11 +30,6 @@ impl SourceInput {
                 value: input.to_string(),
             });
         }
-        if input.starts_with("git@") || input.starts_with("ssh://") {
-            return Err(Error::Message(format!(
-                "SSH sources are not supported: {input}; use https://github.com/<owner>/<repo> or <owner>/<repo> shorthand"
-            )));
-        }
         if input.starts_with("http://") || input.starts_with("https://") {
             parse_github_url(input)
         } else {
@@ -39,8 +37,25 @@ impl SourceInput {
         }
     }
 
+    pub fn parse_remote(input: &str) -> Result<Self> {
+        if !input.contains("://") && input.contains(':') && input.contains('@') {
+            return Ok(Self::Git(input.parse()?));
+        }
+        if input.starts_with("ssh://") {
+            return Err(Error::Message(
+                "ssh:// sources are not supported; use SCP-style user@host:path".to_string(),
+            ));
+        }
+        if input.contains("://") && !input.starts_with("https://") && !input.starts_with("http://")
+        {
+            return Err(Error::Message("unsupported URL source; use a GitHub HTTPS repository URL or SCP-style user@host:path".to_string()));
+        }
+        Self::parse_github(input)
+    }
+
     pub fn into_spec(self) -> Result<SourceSpec> {
         match self {
+            Self::Git(remote) => Ok(remote.into()),
             Self::Bundled => Ok(SourceSpec {
                 kind: SourceKind::Bundled,
                 path: "self".to_string(),
@@ -67,7 +82,8 @@ impl SourceInput {
                 path: github_clone_url(&owner, &repository),
                 r#ref: subpath
                     .as_ref()
-                    .map(|_| GitRef::parse("main").expect("main is a valid git ref")),
+                    .map(|_| GitRef::parse("main"))
+                    .transpose()?,
                 subpath,
             }),
         }
@@ -93,7 +109,7 @@ impl FromStr for SourceInput {
             return Ok(Self::Local(Utf8PathBuf::from(input)));
         }
 
-        Self::parse_github(input)
+        Self::parse_remote(input)
     }
 }
 
@@ -178,11 +194,17 @@ fn parse_github_url(input: &str) -> Result<SourceInput> {
         .strip_prefix("https://github.com/")
         .or_else(|| input.strip_prefix("http://github.com/"))
     else {
-        return Err(Error::Message(format!(
-            "unsupported URL source: {input}; only GitHub repository URLs are supported"
-        )));
+        return Err(Error::Message(
+            "unsupported URL source; only GitHub repository URLs and SCP-style SSH addresses are supported".to_string()
+        ));
     };
 
+    if rest.contains('@') || rest.contains('?') || rest.contains('#') {
+        return Err(Error::Message(
+            "unsupported GitHub repository URL; credentials, queries and fragments are not allowed"
+                .to_string(),
+        ));
+    }
     let rest = rest.trim_end_matches('/');
     let parts: Vec<_> = rest.split('/').collect();
     if parts.len() > 2 {
@@ -224,6 +246,8 @@ fn parse_github_url(input: &str) -> Result<SourceInput> {
         });
     }
 
+    let _: GitRemote = github_clone_url(parts[0], repository).parse()?;
+
     let subpath = if parts.len() == 2 {
         None
     } else {
@@ -248,18 +272,9 @@ fn github_clone_url(owner: &str, repository: &str) -> String {
     format!("https://github.com/{owner}/{repository}.git")
 }
 
-fn valid_repo_part(value: &str) -> bool {
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::source::*;
 
     #[test]
     fn parses_github_shorthand_with_ref() {
@@ -351,19 +366,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_remote_url_and_ssh_sources_actionably() {
+    fn rejects_unsupported_remote_url_and_ssh_scheme_actionably() {
         let error: yasm_core::Error = "https://gitlab.com/owner/repo"
             .parse::<SourceInput>()
             .unwrap_err();
         assert!(error.to_string().contains("only GitHub repository URLs"));
 
-        for input in [
-            "git@github.com:owner/repo.git",
-            "ssh://git@github.com/owner/repo.git",
-        ] {
-            let error: yasm_core::Error = input.parse::<SourceInput>().unwrap_err();
-            assert!(error.to_string().contains("SSH sources are not supported"));
-        }
+        let error = "ssh://git@github.com/owner/repo.git"
+            .parse::<SourceInput>()
+            .unwrap_err();
+        assert!(error.to_string().contains("use SCP-style"));
     }
 
     #[test]
@@ -390,5 +402,32 @@ mod tests {
             SourceInput::Local(path) if path == "../repo"
         ));
         assert!("owner/../repo".parse::<SourceInput>().is_err());
+    }
+}
+
+#[cfg(test)]
+mod ssh_source_tests {
+    use crate::SourceInput;
+    use yasm_core::SourceKind;
+
+    #[test]
+    fn scp_username_is_not_a_git_ref() {
+        let address = "git@work-alias:team/private-skills.git";
+        let spec = address.parse::<SourceInput>().unwrap().into_spec().unwrap();
+        assert_eq!(spec.kind, SourceKind::Git);
+        assert_eq!(spec.path, address);
+        assert!(spec.r#ref.is_none());
+    }
+
+    #[test]
+    fn rejects_credential_urls_without_echoing_the_secret() {
+        for address in [
+            "https://user:top-secret@github.com/team/repo",
+            "https://github.com/team/repo?token=top-secret",
+            "git:top-secret@host:repo",
+        ] {
+            let error = address.parse::<SourceInput>().unwrap_err();
+            assert!(!format!("{error:?} {error}").contains("top-secret"));
+        }
     }
 }
