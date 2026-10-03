@@ -14,12 +14,26 @@ pub struct FetchedSource {
     pub root: Utf8PathBuf,
     pub source: SourceSpec,
     pub resolved: Option<ResolvedSource>,
+    pub(crate) lease: Option<git::CheckoutLease>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FetchedCheckout {
     pub root: Utf8PathBuf,
     pub resolved: Option<ResolvedSource>,
+    pub(crate) lease: Option<git::CheckoutLease>,
+}
+
+impl FetchedSource {
+    pub fn checkout_lease(&self) -> Option<git::CheckoutLease> {
+        self.lease.clone()
+    }
+}
+
+impl FetchedCheckout {
+    pub fn checkout_lease(&self) -> Option<git::CheckoutLease> {
+        self.lease.clone()
+    }
 }
 
 pub fn fetch_source(source: &SourceSpec, destination: &Utf8Path) -> Result<FetchedSource> {
@@ -43,7 +57,7 @@ pub fn fetch_checkout_cached(source: &SourceSpec, cache_dir: &Utf8Path) -> Resul
             &cache_dir.join(format!("{}-{}", cache_key(source), self_bundle_digest())),
         ),
         SourceKind::Local => fetch_local_checkout(source),
-        SourceKind::Github => git::fetch_checkout_cached(source, cache_dir),
+        SourceKind::Github | SourceKind::Git => git::fetch_checkout_cached(source, cache_dir),
         SourceKind::Owned => Err(Error::Message(
             "locally owned skills have no upstream; use `yasm add` to attach a source".to_string(),
         )),
@@ -58,6 +72,7 @@ pub fn resolve_fetched_source(
         root: source_root(source, &checkout.root)?,
         source: source.clone(),
         resolved: checkout.resolved.clone(),
+        lease: checkout.lease.clone(),
     })
 }
 
@@ -65,7 +80,7 @@ fn fetch_checkout(source: &SourceSpec, destination: &Utf8Path) -> Result<Fetched
     match source.kind {
         SourceKind::Bundled => fetch_bundled_checkout(source, destination),
         SourceKind::Local => fetch_local_checkout(source),
-        SourceKind::Github => git::fetch_checkout(source, destination),
+        SourceKind::Github | SourceKind::Git => git::fetch_checkout(source, destination),
         SourceKind::Owned => Err(Error::Message(
             "locally owned skills have no upstream; use `yasm add` to attach a source".to_string(),
         )),
@@ -83,6 +98,7 @@ fn fetch_bundled_checkout(source: &SourceSpec, destination: &Utf8Path) -> Result
     Ok(FetchedCheckout {
         root,
         resolved: None,
+        lease: None,
     })
 }
 
@@ -90,6 +106,7 @@ fn fetch_local_checkout(source: &SourceSpec) -> Result<FetchedCheckout> {
     Ok(FetchedCheckout {
         root: Utf8PathBuf::from(source.path.clone()),
         resolved: None,
+        lease: None,
     })
 }
 
@@ -100,7 +117,7 @@ fn source_root(source: &SourceSpec, repository_root: &Utf8Path) -> Result<Utf8Pa
     let root = repository_root.join(subpath.as_str());
     if !root.exists() {
         return Err(Error::Message(format!(
-            "GitHub directory `{}` was not found in {} at {}",
+            "Git directory `{}` was not found in {} at {}",
             subpath.as_str(),
             source.path,
             source
@@ -111,7 +128,7 @@ fn source_root(source: &SourceSpec, repository_root: &Utf8Path) -> Result<Utf8Pa
     }
     if !root.is_dir() {
         return Err(Error::Message(format!(
-            "GitHub tree path `{}` is not a directory in {}",
+            "Git tree path `{}` is not a directory in {}",
             subpath.as_str(),
             source.path
         )));
@@ -123,13 +140,13 @@ fn source_root(source: &SourceSpec, repository_root: &Utf8Path) -> Result<Utf8Pa
     })?;
     let canonical_root = std::fs::canonicalize(&root).map_err(|error| {
         Error::Message(format!(
-            "failed to resolve GitHub directory `{}`: {error}",
+            "failed to resolve Git directory `{}`: {error}",
             subpath.as_str()
         ))
     })?;
     if !canonical_root.starts_with(&canonical_repository) {
         return Err(Error::Message(format!(
-            "GitHub tree path `{}` resolves outside the repository",
+            "Git tree path `{}` resolves outside the repository",
             subpath.as_str()
         )));
     }
@@ -251,10 +268,11 @@ mod cache_tests {
         let first = fetch_source_cached(&source, &cache).unwrap();
         let first_root = first.root.clone();
         let first_commit = git_text(&remote, &["rev-parse", "HEAD"]);
-        assert_eq!(first.resolved.unwrap().commit, first_commit);
+        assert_eq!(first.resolved.as_ref().unwrap().commit, first_commit);
         assert!(first_root.join(".git").exists());
         std::fs::write(first_root.join("untracked.tmp"), "cache artifact").unwrap();
 
+        drop(first);
         write_skill(&remote, "new");
         git(&remote, &["add", "."]);
         git(&remote, &["commit", "-m", "new"]);
@@ -293,13 +311,14 @@ mod cache_tests {
         let first = fetch_source_cached(&source, &cache).unwrap();
         let first_root = first.root.clone();
         let first_commit = git_text(&remote, &["rev-parse", "HEAD"]);
-        let first_resolved = first.resolved.unwrap();
+        let first_resolved = first.resolved.as_ref().unwrap();
         assert_eq!(first_resolved.r#ref, None);
         assert_eq!(first_resolved.commit, first_commit);
         assert_eq!(
             git_text(&first_root, &["symbolic-ref", "refs/remotes/origin/HEAD"]),
             "refs/remotes/origin/develop"
         );
+        drop(first);
 
         write_skill(&remote, "new");
         git(&remote, &["add", "."]);
@@ -313,6 +332,36 @@ mod cache_tests {
         assert_eq!(second_resolved.commit, second_commit);
         let content = std::fs::read_to_string(second.root.join("skills/example/SKILL.md")).unwrap();
         assert!(content.contains("new"));
+    }
+
+    #[test]
+    fn checkout_lease_prevents_updates_until_all_readers_release_it() {
+        let remote_temp = tempdir().unwrap();
+        let remote = Utf8PathBuf::from_path_buf(remote_temp.path().to_path_buf()).unwrap();
+        git(&remote, &["init", "-b", "main"]);
+        git(&remote, &["config", "user.email", "test@example.com"]);
+        git(&remote, &["config", "user.name", "Test"]);
+        write_skill(&remote, "old");
+        git(&remote, &["add", "."]);
+        git(&remote, &["commit", "-m", "old"]);
+        let cache_temp = tempdir().unwrap();
+        let cache = Utf8PathBuf::from_path_buf(cache_temp.path().to_path_buf()).unwrap();
+        let source = SourceSpec {
+            kind: SourceKind::Github,
+            path: remote.to_string(),
+            r#ref: None,
+            subpath: None,
+        };
+        let first = fetch_source_cached(&source, &cache).unwrap();
+        let reader = first.clone();
+        assert!(fetch_source_cached(&source, &cache)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot lock Git checkout"));
+        drop(first);
+        assert!(fetch_source_cached(&source, &cache).is_err());
+        drop(reader);
+        assert!(fetch_source_cached(&source, &cache).is_ok());
     }
 
     #[test]
@@ -335,12 +384,14 @@ mod cache_tests {
             subpath: None,
         };
         let first = crate::git::fetch_pinned_checkout(&source, &commit, &cache).unwrap();
-        assert_eq!(first.resolved.unwrap().commit, commit);
+        assert_eq!(first.resolved.as_ref().unwrap().commit, commit);
+        let first_root = first.root.clone();
+        drop(first);
         write_skill(&remote, "new upstream");
         git(&remote, &["add", "."]);
         git(&remote, &["commit", "-m", "new"]);
         let second = crate::git::fetch_pinned_checkout(&source, &commit, &cache).unwrap();
-        assert_eq!(second.root, first.root);
+        assert_eq!(second.root, first_root);
         assert_eq!(second.resolved.unwrap().commit, commit);
         assert!(
             std::fs::read_to_string(second.root.join("skills/example/SKILL.md"))

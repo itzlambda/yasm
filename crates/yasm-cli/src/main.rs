@@ -91,7 +91,7 @@ enum Command {
         #[arg(
             long,
             conflicts_with_all = ["with_upstream", "no_migrate"],
-            help = "Adopt selected skills as `local` or with this GitHub source"
+            help = "Adopt selected skills as `local` or with this Git source"
         )]
         source: Option<String>,
         #[arg(
@@ -116,7 +116,7 @@ enum Command {
         #[arg(
             long,
             conflicts_with = "with_upstream",
-            help = "Adopt selected skills as `local` or with this GitHub source"
+            help = "Adopt selected skills as `local` or with this Git source"
         )]
         source: Option<String>,
         #[arg(long, value_enum, help = "Migration action to use without prompting")]
@@ -130,7 +130,7 @@ enum Command {
         #[command(flatten)]
         scope: ScopeArgs,
         #[arg(
-            help = "`self`, local path, GitHub owner/repo shorthand, repository URL, or /tree/main/<directory> URL"
+            help = "`self`, local path, GitHub owner/repo shorthand, repository URL, SCP-style user@host:path, or /tree/main/<directory> URL"
         )]
         source: SourceInput,
         #[arg(
@@ -853,7 +853,12 @@ fn migration_source_label(source: &SourceSpec) -> String {
         .strip_prefix("https://github.com/")
         .unwrap_or(&source.path)
         .trim_end_matches(".git");
-    let mut label = format!("github:{repository}");
+    let prefix = if source.kind == SourceKind::Git {
+        "git"
+    } else {
+        "github"
+    };
+    let mut label = format!("{prefix}:{repository}");
     if let Some(git_ref) = &source.r#ref {
         label.push('@');
         label.push_str(git_ref.as_str());
@@ -958,8 +963,8 @@ fn source_from_skills_cli_entry(
         .iter()
         .chain(entry.source.iter())
         .find_map(|source| {
-            let source = SourceInput::parse_github(source).ok()?.into_spec().ok()?;
-            (source.kind == SourceKind::Github).then_some(source)
+            let source = SourceInput::parse_remote(source).ok()?.into_spec().ok()?;
+            source.kind.is_git().then_some(source)
         })?;
     source.subpath = subpath;
     source.r#ref = if include_ref {
@@ -1103,7 +1108,7 @@ fn validate_manual_migration_source(
     candidate: &MigrationCandidate,
     input: &str,
 ) -> Result<SourceSpec> {
-    let mut source = SourceInput::parse_github(input)?.into_spec()?;
+    let mut source = SourceInput::parse_remote(input)?.into_spec()?;
     let temp = tempdir()?;
     let progress = progress::Progress::start(
         format!("Checking source for {} ...", candidate.skill_id),
@@ -1136,7 +1141,7 @@ fn validate_manual_migration_source(
             available.sort();
             available.dedup();
             anyhow::bail!(
-                "skill `{}` was not found in the GitHub source; available skills: {}",
+                "skill `{}` was not found in the Git source; available skills: {}",
                 candidate.skill_id,
                 if available.is_empty() {
                     "none".to_string()
@@ -1147,7 +1152,7 @@ fn validate_manual_migration_source(
         }
         [selected] => *selected,
         _ => anyhow::bail!(
-            "skill `{}` is ambiguous in the GitHub source; matching paths: {}",
+            "skill `{}` is ambiguous in the Git source; matching paths: {}",
             candidate.skill_id,
             matches
                 .iter()
@@ -1329,7 +1334,7 @@ fn run_interactive_migration(
         let labels = if has_source_decisions {
             vec![
                 "Keep some as local skills in Yasm".to_string(),
-                "Set a GitHub source for a skill".to_string(),
+                "Set a Git source for a skill".to_string(),
                 "Finish for now".to_string(),
             ]
         } else {
@@ -1403,14 +1408,14 @@ fn run_interactive_migration(
                     .collect::<Vec<_>>();
                 let selected = interactive::ask_select(
                     "skill source",
-                    "Choose a skill to give a GitHub source",
+                    "Choose a skill to give a Git source",
                     &skill_labels,
                     "pass `--skill <name> --source <owner/repo> --action apply`",
                 )?;
                 let index = sourceable[selected].0;
                 let input = interactive::ask_input(
-                    "GitHub source",
-                    "GitHub repository or skill-directory URL",
+                    "Git source",
+                    "Git repository address or GitHub skill-directory URL",
                     "pass `--source <owner/repo>` or a GitHub tree URL",
                 )?;
                 let mut candidate = remaining[index].clone();
@@ -2374,7 +2379,7 @@ fn add(
     if discovered.is_empty() {
         if let Some(subpath) = &source.subpath {
             anyhow::bail!(
-                "no valid skills found in GitHub directory `{}`",
+                "no valid skills found in Git directory `{}`",
                 subpath.as_str()
             );
         }
@@ -2448,7 +2453,7 @@ fn add(
             &managed.skill_id,
             &installed_path,
             &managed.skill.directory,
-            source.kind == SourceKind::Github,
+            source.kind.is_git(),
         )?;
         let mut locked_agents = managed.existing_record.enabled.clone();
         locked_agents.extend(agent_ids(&agents));
@@ -2499,7 +2504,7 @@ fn add(
                     &candidate.skill_id,
                     candidate.skill,
                     &candidate.replacements,
-                    source.kind == SourceKind::Github,
+                    source.kind.is_git(),
                 )?;
                 print_add_diff(&candidate.skill_id, &diff);
             }
@@ -2606,7 +2611,7 @@ fn add(
                         &candidate.skill_id,
                         candidate.skill,
                         &candidate.replacements,
-                        source.kind == SourceKind::Github,
+                        source.kind.is_git(),
                     )?;
                     print_add_diff(&candidate.skill_id, &diff);
                     interactive::ask_confirm(
@@ -3153,7 +3158,7 @@ fn display_enabled_agents(record: &LockedSkillRecord) -> String {
 fn display_source_root(record: &LockedSkillRecord) -> String {
     let path = match record.source.kind {
         SourceKind::Bundled => "Yasm bundled skills".to_string(),
-        SourceKind::Github => record
+        SourceKind::Github | SourceKind::Git => record
             .source
             .path
             .strip_suffix(".git")
@@ -3223,7 +3228,7 @@ fn info(context: &ScopeContext, skill: &str) -> Result<()> {
                 println!("Bundled release: {}", bundle.release);
             }
         }
-        SourceKind::Github => {
+        SourceKind::Github | SourceKind::Git => {
             println!("Source type: Git");
             println!("Repository: {}", display_source_root(record));
             println!("Skill path: {}", source_skill_path(record));
@@ -3897,7 +3902,7 @@ fn check_update_candidate(
         skill_id,
         &installed_path,
         &selected_skill.directory,
-        record.source.kind == SourceKind::Github,
+        record.source.kind.is_git(),
     )?;
     if !diff.changed && (fetched.resolved.is_none() || record.resolved == fetched.resolved) {
         return Ok(None);
@@ -4075,7 +4080,7 @@ enum SourceCheckoutKey {
     Local {
         path: String,
     },
-    Github {
+    Git {
         path: String,
         git_ref: Option<String>,
     },
@@ -4091,7 +4096,7 @@ impl From<&SourceSpec> for SourceCheckoutKey {
             SourceKind::Local => Self::Local {
                 path: source.path.clone(),
             },
-            SourceKind::Github => Self::Github {
+            SourceKind::Github | SourceKind::Git => Self::Git {
                 path: source.path.clone(),
                 git_ref: source
                     .r#ref

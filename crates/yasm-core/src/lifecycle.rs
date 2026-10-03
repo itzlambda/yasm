@@ -12,7 +12,7 @@ use crate::fs::{
 use crate::lockfile::{LockFile, LockedSkillRecord};
 use crate::paths::{normalize_path, YasmPaths};
 use crate::store::Store;
-use crate::types::{ResolvedSource, SkillId, SkillName, SkillPath, SourceKind, SourceSpec};
+use crate::types::{ResolvedSource, SkillId, SkillName, SkillPath, SourceSpec};
 
 #[derive(Debug, Clone)]
 pub enum LinkMode {
@@ -46,7 +46,7 @@ impl<'a> Lifecycle<'a> {
         skill_path: SkillPath,
         source_dir: &Utf8Path,
     ) -> Result<Utf8PathBuf> {
-        let store_path = if source.kind == SourceKind::Github {
+        let store_path = if source.kind.is_git() {
             self.store.install_skill_source_dir(skill_id, source_dir)?
         } else {
             self.store.install_skill_dir(skill_id, source_dir)?

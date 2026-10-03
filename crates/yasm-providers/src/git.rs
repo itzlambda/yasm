@@ -1,29 +1,182 @@
 //! Shared Git checkout and subprocess handling for skill and marketplace sources.
 
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use camino::Utf8Path;
 use sha2::{Digest, Sha256};
-use yasm_core::{Error, ResolvedSource, Result, SourceSpec};
+use yasm_core::{Error, ResolvedSource, Result, SourceKind, SourceSpec};
 
 use crate::{cache_key, FetchedCheckout};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Keep a managed checkout locked while callers inspect or copy its contents.
+#[derive(Debug, Clone)]
+pub struct CheckoutLease {
+    _file: Arc<File>,
+}
+
+fn checkout_lease(cache_dir: &Utf8Path, key: &str) -> Result<CheckoutLease> {
+    let path = cache_dir.join(format!("{key}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| yasm_core::error::io(&path, error))?;
+    file.try_lock().map_err(|error| Error::Message(format!(
+        "cannot lock Git checkout cache; another Yasm command may be using it; retry after that command finishes: {error}"
+    )))?;
+    Ok(CheckoutLease {
+        _file: Arc::new(file),
+    })
+}
+
+fn managed_checkout_exists(destination: &Utf8Path) -> Result<bool> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            let git_dir = destination.join(".git");
+            if std::fs::symlink_metadata(&git_dir)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            {
+                Ok(true)
+            } else {
+                Err(Error::Message(format!(
+                    "source cache exists but is not a managed Git repository: {destination}"
+                )))
+            }
+        }
+        Ok(_) => Err(Error::Message(format!(
+            "source cache exists but is not a managed Git repository: {destination}"
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(yasm_core::error::io(destination, error)),
+    }
+}
+
+/// A repository address validated independently of skill or catalog inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRemote {
+    address: String,
+    transport: GitTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitTransport {
+    Https,
+    Ssh,
+}
+
+impl GitRemote {
+    pub fn as_str(&self) -> &str {
+        &self.address
+    }
+
+    pub fn transport(&self) -> GitTransport {
+        self.transport
+    }
+}
+
+impl From<GitRemote> for SourceSpec {
+    fn from(remote: GitRemote) -> Self {
+        Self {
+            kind: match remote.transport {
+                GitTransport::Https => SourceKind::Github,
+                GitTransport::Ssh => SourceKind::Git,
+            },
+            path: remote.address,
+            r#ref: None,
+            subpath: None,
+        }
+    }
+}
+
+impl std::str::FromStr for GitRemote {
+    type Err = Error;
+
+    fn from_str(input: &str) -> Result<Self> {
+        let invalid = || {
+            Error::Message(
+                concat!(
+            "invalid Git remote; use a GitHub HTTPS repository URL or SCP-style user@host:path; ",
+            "credentials, URL queries and fragments are not allowed"
+        )
+                .to_string(),
+            )
+        };
+        if let Some(path) = input.strip_prefix("https://github.com/") {
+            let parts: Vec<_> = path.trim_end_matches('/').split('/').collect();
+            if parts.len() != 2 || !parts.iter().all(|part| valid_repo_part(part)) {
+                return Err(invalid());
+            }
+            let repository = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
+            if !valid_repo_part(repository) {
+                return Err(invalid());
+            }
+            return Ok(Self {
+                address: format!("https://github.com/{}/{repository}.git", parts[0]),
+                transport: GitTransport::Https,
+            });
+        }
+        if input.contains("://") {
+            return Err(invalid());
+        }
+        let Some((authority, path)) = input.split_once(':') else {
+            return Err(invalid());
+        };
+        let Some((user, host)) = authority.split_once('@') else {
+            return Err(invalid());
+        };
+        if !valid_repo_part(user)
+            || !valid_repo_part(host)
+            || user.starts_with('-')
+            || host.starts_with('-')
+            || path.is_empty()
+            || path.starts_with('-')
+            || !path
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte))
+            || path
+                .trim_start_matches('/')
+                .split('/')
+                .any(|part| !valid_repo_part(part))
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            address: input.to_string(),
+            transport: GitTransport::Ssh,
+        })
+    }
+}
+
 pub fn fetch_checkout(source: &SourceSpec, destination: &Utf8Path) -> Result<FetchedCheckout> {
+    let cleanup_on_failure = !destination.exists()
+        || std::fs::read_dir(destination).is_ok_and(|mut entries| entries.next().is_none());
     let mut command = git_command();
     command.arg("clone").arg("--depth").arg("1");
     if let Some(git_ref) = &source.r#ref {
         command.arg("--branch").arg(git_ref.as_str());
     }
-    command.arg(&source.path).arg(destination);
-    run_git(command, source, "git clone")?;
+    command.arg("--").arg(&source.path).arg(destination);
+    if let Err(error) = run_git(command, source, "git clone") {
+        // Callers only clone into empty staging/cache destinations owned by Yasm.
+        // Git may leave a partial clone after a timeout or authentication failure.
+        if cleanup_on_failure {
+            let _ = std::fs::remove_dir_all(destination);
+        }
+        return Err(error);
+    }
 
     Ok(FetchedCheckout {
         root: destination.to_path_buf(),
         resolved: Some(resolve_git_source(source, destination)?),
+        lease: None,
     })
 }
 
@@ -34,13 +187,11 @@ pub fn fetch_checkout_cached(source: &SourceSpec, cache_dir: &Utf8Path) -> Resul
             cache_dir
         ))
     })?;
-    let destination = cache_dir.join(cache_key(source));
-    if destination.join(".git").exists() {
+    let key = cache_key(source);
+    let lease = checkout_lease(cache_dir, &key)?;
+    let destination = cache_dir.join(key);
+    if managed_checkout_exists(&destination)? {
         update_cached_git(source, &destination)?;
-    } else if destination.exists() {
-        return Err(Error::Message(format!(
-            "source cache path exists but is not a git repository: {destination}"
-        )));
     } else {
         fetch_checkout(source, &destination)?;
     }
@@ -49,6 +200,7 @@ pub fn fetch_checkout_cached(source: &SourceSpec, cache_dir: &Utf8Path) -> Resul
     Ok(FetchedCheckout {
         root: destination,
         resolved: Some(resolved),
+        lease: Some(lease),
     })
 }
 
@@ -67,33 +219,24 @@ pub fn fetch_pinned_checkout(
         "{:x}",
         Sha256::digest(format!("{}\0{sha}", source.path).as_bytes())
     );
+    std::fs::create_dir_all(cache_dir).map_err(|error| yasm_core::error::io(cache_dir, error))?;
+    let lease = checkout_lease(cache_dir, &key)?;
     let destination = cache_dir.join(key);
-    match std::fs::symlink_metadata(&destination) {
-        Ok(metadata)
-            if metadata.is_dir()
-                && !metadata.file_type().is_symlink()
-                && destination.join(".git").is_dir() => {}
-        Ok(_) => {
-            return Err(Error::Message(format!(
-                "plugin cache exists but is not a managed Git repository: {destination}"
-            )));
+    if !managed_checkout_exists(&destination)? {
+        let mut clone = git_command();
+        clone
+            .args([
+                "clone",
+                "--no-checkout",
+                "--filter=blob:none",
+                "--",
+                &source.path,
+            ])
+            .arg(&destination);
+        if let Err(error) = run_git(clone, source, "clone pinned plugin source") {
+            let _ = std::fs::remove_dir_all(&destination);
+            return Err(error);
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(cache_dir)
-                .map_err(|error| yasm_core::error::io(cache_dir, error))?;
-            let mut clone = git_command();
-            clone
-                .args([
-                    "clone",
-                    "--no-checkout",
-                    "--filter=blob:none",
-                    "--",
-                    &source.path,
-                ])
-                .arg(&destination);
-            run_git(clone, source, "clone pinned plugin source")?;
-        }
-        Err(error) => return Err(yasm_core::error::io(&destination, error)),
     }
     let mut fetch = git_command();
     fetch
@@ -111,6 +254,7 @@ pub fn fetch_pinned_checkout(
     Ok(FetchedCheckout {
         root: destination,
         resolved: Some(resolved),
+        lease: Some(lease),
     })
 }
 
@@ -189,9 +333,90 @@ fn git_stdout(command: Command, source: &SourceSpec, action: &str) -> Result<Str
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn run_git_output(command: Command, source: &SourceSpec, action: &str) -> Result<Output> {
+fn run_git_output(mut command: Command, source: &SourceSpec, action: &str) -> Result<Output> {
+    if source.kind == SourceKind::Git {
+        let remote: GitRemote = source.path.parse()?;
+        if remote.transport() == GitTransport::Ssh {
+            configure_ssh(&mut command, source)?;
+        }
+    }
     run_command_with_timeout(command, GIT_TIMEOUT)
         .map_err(|error| command_error(error, source, action))
+}
+
+// Read user Git settings with the same bounded subprocess runner, without SSH setup recursion.
+fn git_setting(name: &str, source: &SourceSpec) -> Result<Option<String>> {
+    let mut command = git_command();
+    command.args(["config", "--get", name]);
+    let output = run_command_with_timeout(command, GIT_TIMEOUT)
+        .map_err(|error| command_error(error, source, "git config"))?;
+    match output.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )),
+        Some(1) => Ok(None),
+        _ => Err(unsuccessful_git_output(&output, source, "git config")),
+    }
+}
+
+fn configure_ssh(command: &mut Command, source: &SourceSpec) -> Result<()> {
+    let variant = match std::env::var("GIT_SSH_VARIANT") {
+        Ok(variant) => Some(variant),
+        Err(_) => git_setting("ssh.variant", source)?,
+    };
+    if variant
+        .as_deref()
+        .is_some_and(|variant| variant != "ssh" && variant != "auto")
+    {
+        return Err(Error::Message("SCP-style sources require an OpenSSH-compatible command; set GIT_SSH_VARIANT=ssh and configure keys in ~/.ssh/config".to_string()));
+    }
+    let words = if let Ok(configured) = std::env::var("GIT_SSH_COMMAND") {
+        parse_ssh_command(&configured)?
+    } else if let Some(configured) = git_setting("core.sshCommand", source)? {
+        parse_ssh_command(&configured)?
+    } else if let Ok(executable) = std::env::var("GIT_SSH") {
+        vec![executable]
+    } else {
+        vec!["ssh".to_string()]
+    };
+    let ssh_command = noninteractive_ssh_command(&words)?;
+    command
+        .env("GIT_SSH_COMMAND", ssh_command)
+        .env("GIT_SSH_VARIANT", "ssh")
+        .env("SSH_ASKPASS_REQUIRE", "never");
+    Ok(())
+}
+
+fn parse_ssh_command(configured: &str) -> Result<Vec<String>> {
+    // Accept executable/argument commands, not shell expressions that would bypass our options.
+    if configured.contains(['\n', '\r', ';', '|', '&', '$', '`', '<', '>']) {
+        return Err(Error::Message("SSH command must be an executable with arguments; move shell logic into an OpenSSH-compatible wrapper".to_string()));
+    }
+    shlex::split(configured)
+        .filter(|words| !words.is_empty())
+        .ok_or_else(|| {
+            Error::Message(
+                "invalid SSH command; configure an OpenSSH-compatible executable with arguments"
+                    .to_string(),
+            )
+        })
+}
+
+fn noninteractive_ssh_command(words: &[String]) -> Result<String> {
+    let Some((executable, arguments)) = words.split_first() else {
+        return Err(Error::Message("SSH command is empty".to_string()));
+    };
+    if executable.is_empty() {
+        return Err(Error::Message("SSH executable is empty".to_string()));
+    }
+    // OpenSSH uses the first supplied value, so insert required options before user arguments.
+    let mut command = vec![
+        executable.as_str(),
+        "-oBatchMode=yes",
+        "-oStrictHostKeyChecking=yes",
+    ];
+    command.extend(arguments.iter().map(String::as_str));
+    shlex::try_join(command).map_err(|_| Error::Message("invalid SSH command".to_string()))
 }
 
 fn unsuccessful_git_output(output: &Output, source: &SourceSpec, action: &str) -> Error {
@@ -208,8 +433,13 @@ fn unsuccessful_git_output(output: &Output, source: &SourceSpec, action: &str) -
     } else {
         format!(": {detail}")
     };
+    let hint = if source.kind == SourceKind::Git {
+        "; check repository access, available SSH keys/agent, and trusted host keys with Git outside Yasm"
+    } else {
+        ""
+    };
     Error::Message(format!(
-        "{action} failed for {} ({status}){suffix}",
+        "{action} failed for {} ({status}){suffix}{hint}",
         source.path
     ))
 }
@@ -290,6 +520,11 @@ fn run_command_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn().map_err(CommandError::Spawn)?;
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -297,25 +532,33 @@ fn run_command_with_timeout(
     let stderr_handle = std::thread::spawn(move || read_pipe(stderr_pipe));
 
     let deadline = Instant::now() + timeout;
+    let mut exit_status = None;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_handle.join();
-                let _ = stderr_handle.join();
-                return Err(CommandError::Timeout);
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_handle.join();
-                let _ = stderr_handle.join();
-                return Err(CommandError::Wait(err));
+        if exit_status.is_none() {
+            match child.try_wait() {
+                Ok(status) => exit_status = status,
+                Err(error) => {
+                    terminate_process_tree(&mut child);
+                    let _ = child.wait();
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
+                    return Err(CommandError::Wait(error));
+                }
             }
         }
+        if let Some(status) = exit_status {
+            if stdout_handle.is_finished() && stderr_handle.is_finished() {
+                break status;
+            }
+        }
+        if Instant::now() >= deadline {
+            terminate_process_tree(&mut child);
+            let _ = child.wait();
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
+            return Err(CommandError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(50));
     };
 
     let stdout = join_reader(stdout_handle, Stream::Stdout);
@@ -325,6 +568,23 @@ fn run_command_with_timeout(
         stdout: stdout?,
         stderr: stderr?,
     })
+}
+
+fn terminate_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn join_reader(
@@ -342,6 +602,15 @@ fn read_pipe<T: Read>(pipe: Option<T>) -> io::Result<Vec<u8>> {
     let mut pipe = pipe.ok_or_else(|| io::Error::other("subprocess pipe unavailable"))?;
     pipe.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+pub(crate) fn valid_repo_part(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
 }
 
 #[cfg(test)]
@@ -549,5 +818,87 @@ mod command_timeout_tests {
                 || message.contains("repository"),
             "unexpected clone error: {message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ssh_tests {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    use crate::git::{
+        noninteractive_ssh_command, parse_ssh_command, run_command_with_timeout, CommandError,
+        GitRemote, GitTransport,
+    };
+
+    #[test]
+    fn scp_addresses_preserve_aliases_and_nested_paths() {
+        for address in [
+            "git@github.com:team/repo.git",
+            "git@work-alias:group/team/repo",
+            "user@git.example.test:/srv/git/repo.git",
+        ] {
+            let remote: GitRemote = address.parse().unwrap();
+            assert_eq!(remote.as_str(), address);
+            assert_eq!(remote.transport(), GitTransport::Ssh);
+        }
+    }
+
+    #[test]
+    fn invalid_remotes_never_echo_credentials() {
+        for address in [
+            "ssh://git@github.com/team/repo",
+            "https://user:top-secret@github.com/team/repo",
+            "git:top-secret@host:repo",
+            "git@host:repo?token=top-secret",
+            "git@host:repo;touch-file",
+            "git@host:-repo",
+            "-git@host:repo",
+            "git@-host:repo",
+            "git@host:group/../repo",
+            "git@host:",
+            "git@:repo",
+            "https://github.com/team/repo?token=top-secret",
+        ] {
+            let error = address.parse::<GitRemote>().unwrap_err();
+            assert!(!format!("{error:?} {error}").contains("top-secret"));
+        }
+    }
+
+    #[test]
+    fn ssh_policy_precedes_user_options_and_quotes_executable_paths() {
+        let words = parse_ssh_command(
+            "'/path with spaces/ssh' -i 'key file' -oBatchMode=no -oStrictHostKeyChecking=no",
+        )
+        .unwrap();
+        let command = noninteractive_ssh_command(&words).unwrap();
+        let arguments = shlex::split(&command).unwrap();
+        assert_eq!(
+            &arguments[..3],
+            &[
+                "/path with spaces/ssh",
+                "-oBatchMode=yes",
+                "-oStrictHostKeyChecking=yes"
+            ]
+        );
+        assert_eq!(&arguments[3..5], &["-i", "key file"]);
+    }
+
+    #[test]
+    fn ssh_shell_expressions_require_a_wrapper() {
+        for command in ["", "ssh; echo bad", "ssh $(echo bad)", "ssh | cat"] {
+            assert!(parse_ssh_command(command).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_descendants_even_after_parent_exits() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 10 & exit 0"]);
+        let started = Instant::now();
+        let result = run_command_with_timeout(command, Duration::from_millis(200));
+        assert!(matches!(result, Err(CommandError::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
