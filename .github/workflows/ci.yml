@@ -16,8 +16,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read pinned Rust toolchain
+        id: toolchain
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          with open("rust-toolchain.toml", "rb") as file:
+              print(f"channel={tomllib.load(file)['toolchain']['channel']}")
+          PY
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
 
       - uses: swatinem/rust-cache@v2
