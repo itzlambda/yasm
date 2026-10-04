@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn imports_claude_skills_wrapped_and_direct_mcp_and_excludes_agents() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         std::fs::create_dir_all(root.join("skills/one")).unwrap();
         std::fs::create_dir_all(root.join("agents")).unwrap();
         std::fs::write(
@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn cursor_explicit_skill_paths_replace_default_discovery() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         for path in ["skills/default", "custom/selected"] {
             std::fs::create_dir_all(root.join(path)).unwrap();
             std::fs::write(
@@ -725,7 +725,7 @@ mod tests {
     #[test]
     fn codex_portable_components_take_precedence_over_overlay_fields() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         for path in ["skills/portable", "overlay/ignored"] {
             std::fs::create_dir_all(root.join(path)).unwrap();
             std::fs::write(
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn claude_declared_skill_paths_are_additive_and_skill_sidecars_are_retained() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         for path in ["skills/default", "extra/declared"] {
             std::fs::create_dir_all(root.join(path).join("agents")).unwrap();
             std::fs::write(
@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn claude_marketplace_root_skill_override_replaces_default_scan() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         for path in ["skills/default", "selected/only"] {
             std::fs::create_dir_all(root.join(path)).unwrap();
             std::fs::write(
@@ -840,7 +840,7 @@ mod tests {
     #[test]
     fn quoted_source_specific_skill_frontmatter_is_detected_semantically() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         std::fs::create_dir_all(root.join("skills/unsafe")).unwrap();
         std::fs::write(
             root.join("skills/unsafe/SKILL.md"),
@@ -860,7 +860,7 @@ mod tests {
     #[test]
     fn conflicting_mcp_definitions_are_excluded_instead_of_selecting_one() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
         std::fs::write(
             root.join(".claude-plugin/plugin.json"),
@@ -886,7 +886,7 @@ mod tests {
     #[test]
     fn conflict_detection_uses_operational_values_hidden_by_diagnostics() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
         std::fs::write(
             root.join(".claude-plugin/plugin.json"),
@@ -905,7 +905,7 @@ mod tests {
     #[test]
     fn literal_credentials_are_rejected_without_echoing_the_value() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         std::fs::write(
             root.join(".mcp.json"),
             r#"{"mcpServers":{"private":{"type":"http","url":"https://example.test","headers":{"Authorization":"Bearer top-secret"}}}}"#,
@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn nonempty_credential_fallbacks_are_rejected_without_echoing_the_value() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         std::fs::write(
             root.join(".mcp.json"),
             r#"{"mcpServers":{"private":{"type":"http","url":"https://example.test","headers":{"Authorization":"Bearer ${TOKEN:-top-secret}"}}}}"#,
@@ -937,7 +937,7 @@ mod tests {
     #[test]
     fn sensitive_input_defaults_are_rejected_without_echoing_the_value() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
         std::fs::write(
             root.join(".claude-plugin/plugin.json"),
@@ -963,7 +963,7 @@ mod tests {
             "https://example.test/mcp#top-secret",
         ] {
             let temp = tempfile::tempdir().unwrap();
-            let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+            let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
             std::fs::write(
                 root.join(".mcp.json"),
                 serde_json::json!({"mcpServers": {"private": {"type": "http", "url": url}}})
@@ -984,7 +984,7 @@ mod tests {
     #[test]
     fn symbolic_url_credentials_are_preserved() {
         let temp = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
         let url = "https://example.test/mcp?api_key=${env:TOKEN}";
         std::fs::write(
             root.join(".mcp.json"),
@@ -1025,7 +1025,7 @@ mod tests {
             ),
         ] {
             let temp = tempfile::tempdir().unwrap();
-            let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+            let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
             std::fs::write(
                 root.join(".mcp.json"),
                 serde_json::json!({"mcpServers": {"private": server}}).to_string(),
@@ -1045,7 +1045,7 @@ mod tests {
             serde_json::json!({"name": "public", "type": "string", "options": [{"token": "top-secret"}]}),
         ] {
             let temp = tempfile::tempdir().unwrap();
-            let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+            let root = Utf8PathBuf::from_path_buf(temp.path().canonicalize().unwrap()).unwrap();
             std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
             std::fs::write(
                 root.join(".claude-plugin/plugin.json"),
