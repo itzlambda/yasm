@@ -8,5 +8,9 @@ repository.workspace = true
 camino.workspace = true
 etcetera.workspace = true
 sha2.workspace = true
+shlex.workspace = true
 tempfile.workspace = true
 yasm-core.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true

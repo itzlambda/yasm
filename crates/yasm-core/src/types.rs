@@ -139,8 +139,15 @@ impl std::str::FromStr for SkillPath {
 pub enum SourceKind {
     Bundled,
     Github,
+    Git,
     Local,
     Owned,
+}
+
+impl SourceKind {
+    pub fn is_git(&self) -> bool {
+        matches!(self, Self::Github | Self::Git)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

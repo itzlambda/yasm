@@ -36,7 +36,7 @@ curl -fsSL https://yasm.itzlambda.com/install | sh
 ```
 
 The installer asks before adding Yasm to your `PATH`. Follow its instructions to
-start using `yasm` in your shell. Yasm requires `git` to fetch GitHub sources.
+start using `yasm` in your shell. Yasm requires `git` to fetch Git repositories.
 On Windows, use WSL with your project on the Linux filesystem.
 
 To upgrade:
@@ -96,9 +96,9 @@ yasm init --action apply
 
 For an existing Yasm project, use `yasm migrate --action apply`. To adopt global
 skills, use `yasm migrate --global --action apply`. In an interactive terminal,
-Yasm first shows recorded and recommended GitHub sources and lets you accept
+Yasm first shows recorded and recommended Git sources and lets you accept
 them, then asks whether each remaining skill should be kept as local, assigned a
-different GitHub source, or left unmanaged for now. Migration preserves the
+different Git source, or left unmanaged for now. Migration preserves the
 installed files; accepting a source only configures where a later update checks.
 The original installed revision remains unknown until an applied update verifies
 the complete installed tree or installs fetched content.
@@ -112,11 +112,11 @@ yasm migrate --with-upstream --action apply
 # Keep one candidate as a locally owned skill.
 yasm migrate --skill team-review --source local --action apply
 
-# Validate and attach a different GitHub source while preserving installed files.
+# Validate and attach a different Git source while preserving installed files.
 yasm migrate --skill humanizer --source blader/humanizer --action apply
 ```
 
-`--skill` may be repeated to restrict the eligible set. A GitHub `--source`
+`--skill` may be repeated to restrict the eligible set. A Git `--source`
 requires exactly one selected skill; `--source local` can apply to several.
 Omitting both `--with-upstream` and `--source` retains the existing
 `--action apply` behavior of adopting every eligible candidate. Use the same
@@ -136,6 +136,47 @@ metadata. Different copies, a missing store directory, or a store directory
 without a lock record appear as conflicts during review and must be repaired
 before that skill can be applied. Use `--skill <name>` to migrate unrelated
 skills without applying a reported conflict.
+
+### Private repositories over SSH
+
+Use an SCP-style Git address to install skills from a private repository:
+
+```bash
+yasm add git@github.com:team/private-skills.git --skill code-review --global --action apply
+```
+
+Yasm uses the system Git and an OpenSSH-compatible command, with the user's
+existing SSH configuration and available keys or agent. Establish repository
+access and trust the host outside Yasm first. Password, passphrase, and host
+confirmation prompts are disabled; host key verification remains enabled.
+Encrypted keys must already be available through an agent or another
+noninteractive authentication mechanism.
+
+SSH aliases and nested repository paths are supported, for example
+`git@work-alias:group/team/skills.git`. Configure account identities, custom
+ports, and proxies in `~/.ssh/config`. Yasm preserves the supplied address for
+updates. GitHub `owner/repo` shorthand continues to use HTTPS; `ssh://` URLs
+are unsupported.
+
+The same addresses work with `migrate --source`, `init --source`, marketplace
+sources, and Git plugin sources, including branch/tag references and commit
+pins in catalogs. Direct SSH skill additions use the remote default branch.
+
+Yasm respects `GIT_SSH_COMMAND`, `GIT_SSH`, and `core.sshCommand`, inserting
+OpenSSH batch and host verification options before configured arguments.
+Command overrides must be an executable with arguments; put shell expressions
+in an OpenSSH-compatible wrapper. Other SSH variants such as Plink are not
+supported. All Git checkout paths disable HTTPS credential helpers consistently;
+SSH authentication uses SSH configuration instead.
+
+Cached checkouts stay locked while Yasm reads them. If another command is using
+the same checkout, retry after it finishes. Existing `github` source records
+remain supported; SSH sources use the new `git` kind, which older Yasm versions
+cannot read. Upgrade Yasm before sharing a lockfile containing SSH sources.
+
+Project skill contents are copied into `.yasm/`. Committing that directory shares
+the installed contents with anyone who can access the project, even when the
+upstream skill repository is private.
 
 ### Choose which agents use a skill
 
