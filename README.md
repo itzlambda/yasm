@@ -49,7 +49,7 @@ immediately. Pass `-y` to accept the `PATH` change without a prompt:
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/itzlambda/yasm/main/scripts/install.sh | sh -s -- -y
 ```
 
-Yasm also requires `git` on `PATH` to fetch GitHub sources.
+Yasm also requires `git` on `PATH` to fetch Git repositories.
 
 Upgrade that install from later GitHub releases with:
 
@@ -130,9 +130,9 @@ yasm init --action apply
 
 For an existing Yasm project, use `yasm migrate --action apply`. To adopt global
 skills, use `yasm migrate --global --action apply`. In an interactive terminal,
-Yasm first shows recorded and recommended GitHub sources and lets you accept
+Yasm first shows recorded and recommended Git sources and lets you accept
 them, then asks whether each remaining skill should be kept as local, assigned a
-different GitHub source, or left unmanaged for now. Migration preserves the
+different Git source, or left unmanaged for now. Migration preserves the
 installed files; accepting a source only configures where a later update checks.
 The original installed revision remains unknown until an applied update verifies
 the complete installed tree or installs fetched content.
@@ -146,11 +146,11 @@ yasm migrate --with-upstream --action apply
 # Keep one candidate as a locally owned skill.
 yasm migrate --skill team-review --source local --action apply
 
-# Validate and attach a different GitHub source while preserving installed files.
+# Validate and attach a different Git source while preserving installed files.
 yasm migrate --skill humanizer --source blader/humanizer --action apply
 ```
 
-`--skill` may be repeated to restrict the eligible set. A GitHub `--source`
+`--skill` may be repeated to restrict the eligible set. A Git `--source`
 requires exactly one selected skill; `--source local` can apply to several.
 Omitting both `--with-upstream` and `--source` retains the existing
 `--action apply` behavior of adopting every eligible candidate. Use the same

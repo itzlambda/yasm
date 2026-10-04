@@ -985,7 +985,7 @@ fn source_from_skills_cli_entry(
     entry: &SkillsCliLockEntry,
     include_ref: bool,
 ) -> Option<SourceSpec> {
-    if entry.source_type.as_deref() != Some("github") {
+    if !matches!(entry.source_type.as_deref(), Some("github" | "git")) {
         return None;
     }
     let subpath = normalize_skills_cli_path(entry.skill_path.as_deref()?)?;
@@ -1375,7 +1375,7 @@ fn run_interactive_migration(
             "remaining skills action",
             "What would you like to do with the remaining skills?",
             &labels,
-            "pass `--skill <name> --source <local|owner/repo> --action apply`, or finish without another command",
+            "pass `--skill <name> --source <local|repository> --action apply`, or finish without another command",
         )?;
         if !has_source_decisions {
             break;
@@ -1441,13 +1441,13 @@ fn run_interactive_migration(
                     "skill source",
                     "Choose a skill to give a Git source",
                     &skill_labels,
-                    "pass `--skill <name> --source <owner/repo> --action apply`",
+                    "pass `--skill <name> --source <repository> --action apply`",
                 )?;
                 let index = sourceable[selected].0;
                 let input = interactive::ask_input(
                     "Git source",
                     "Git repository address or GitHub skill-directory URL",
-                    "pass `--source <owner/repo>` or a GitHub tree URL",
+                    "pass `--source <owner/repo>`, an SCP-style user@host:path address, or a GitHub tree URL",
                 )?;
                 let mut candidate = remaining[index].clone();
                 candidate.source = validate_manual_migration_source(context, &candidate, &input)?;

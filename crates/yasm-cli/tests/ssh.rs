@@ -183,6 +183,71 @@ fn scp_root_skill_add_update_and_failure_preserve_provenance_and_files() {
 }
 
 #[test]
+fn scp_migration_recovers_git_and_github_install_history() {
+    for (source_type, source_url) in [
+        ("git", Some(SOURCE)),
+        ("github", Some(SOURCE)),
+        ("git", None),
+    ] {
+        let sandbox = Sandbox::new();
+        let installed = sandbox.root.path().join("agents/.agents/skills/review");
+        std::fs::create_dir_all(&installed).unwrap();
+        let content = "---\nname: review\ndescription: Review\n---\nlocal\n";
+        std::fs::write(installed.join("SKILL.md"), content).unwrap();
+        let state = sandbox.root.path().join("state");
+        let history = state.join("skills/.skill-lock.json");
+        std::fs::create_dir_all(history.parent().unwrap()).unwrap();
+        std::fs::write(
+            &history,
+            serde_json::json!({
+                "version": 3,
+                "skills": {"review": {
+                    "source": SOURCE,
+                    "sourceUrl": source_url,
+                    "sourceType": source_type,
+                    "skillPath": "skills/review/SKILL.md",
+                    "ref": "release"
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let output = sandbox
+            .command()
+            .env("XDG_STATE_HOME", state)
+            .args([
+                "migrate",
+                "--global",
+                "--skill",
+                "review",
+                "--with-upstream",
+                "--action",
+                "apply",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lock = sandbox.lock();
+        let source = &lock["skills"]["review"]["source"];
+        assert_eq!(source["kind"], "git");
+        assert_eq!(source["path"], SOURCE);
+        assert_eq!(source["subpath"], "skills/review");
+        assert_eq!(source["ref"], "release");
+        assert_eq!(
+            std::fs::read_to_string(sandbox.root.path().join("data/skills/review/SKILL.md"))
+                .unwrap(),
+            content
+        );
+        assert!(history.exists());
+    }
+}
+
+#[test]
 fn scp_migration_attaches_an_upstream_without_replacing_installed_content() {
     let sandbox = Sandbox::new();
     sandbox.write(
