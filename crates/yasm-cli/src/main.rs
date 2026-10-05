@@ -1,4 +1,5 @@
 mod binary_update;
+mod bundle;
 mod terminal_diff;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,6 +33,8 @@ use yasm_providers::{
 
 mod interactive;
 mod progress;
+
+use self::bundle::{bundle_member_enabled, SelfBundle};
 
 const DEFAULT_PAGER_COMMAND: &str = "less -R";
 const DEFAULT_LESS_ENV: &str = "R";
@@ -2415,9 +2418,9 @@ fn add(
             );
         }
     }
-    if bundled {
-        validate_self_bundle_manifest(&discovered)?;
-    }
+    let bundle = bundled
+        .then(|| SelfBundle::from_skills(&discovered))
+        .transpose()?;
     let skills = if bundled {
         discovered.iter().collect()
     } else {
@@ -2668,15 +2671,13 @@ fn add(
         }
     }
 
-    if bundled {
+    if let Some(bundle) = &bundle {
         let installed = acquired_self_member_ids(&lock);
-        let complete = self_bundle_skills().iter().all(|skill| {
-            SkillId::parse(skill.id).is_ok_and(|skill_id| installed.contains(&skill_id))
-        });
+        let complete = bundle.members().is_subset(&installed);
         if complete && lock.bundles.contains_key(SELF_BUNDLE_ID) {
-            reconcile_self_bundle(context, &mut lock, effective_action, false)?;
+            reconcile_self_bundle(context, &mut lock, bundle, &source, effective_action, false)?;
         }
-        refresh_self_bundle_receipt(context, &mut lock, &fetched, &agents)?;
+        refresh_self_bundle_receipt(context, &mut lock, bundle, &agents)?;
     }
 
     Ok(())
@@ -2697,52 +2698,20 @@ fn validate_reserved_skill_ids(discovered: &[&DiscoveredSkill], bundled: bool) -
     Ok(())
 }
 
-fn validate_self_bundle_manifest(discovered: &[DiscoveredSkill]) -> Result<()> {
-    let discovered = discovered
-        .iter()
-        .map(|skill| sanitize_skill_id(&skill.name))
-        .collect::<yasm_core::Result<BTreeSet<_>>>()?;
-    let declared = self_bundle_skills()
-        .iter()
-        .map(|skill| SkillId::parse(skill.id))
-        .collect::<yasm_core::Result<BTreeSet<_>>>()?;
-    if discovered != declared {
-        anyhow::bail!("embedded self bundle manifest does not match its skill contents");
-    }
-    Ok(())
-}
-
 fn refresh_self_bundle_receipt(
     context: &ScopeContext,
     lock: &mut LockFile,
-    fetched: &FetchedSource,
+    bundle: &SelfBundle<'_>,
     agents: &[&Agent],
 ) -> Result<()> {
-    let discovery = discover_skills_with_diagnostics(&fetched.root)?;
-    validate_self_bundle_manifest(&discovery.skills)?;
-    let members = discovery
-        .skills
-        .iter()
-        .map(|skill| sanitize_skill_id(&skill.name))
-        .collect::<yasm_core::Result<BTreeSet<_>>>()?;
+    let members = bundle.members();
     let installed = acquired_self_member_ids(lock);
     if installed.is_empty() {
         return Ok(());
     }
 
-    for skill in &discovery.skills {
-        let skill_id = sanitize_skill_id(&skill.name)?;
-        if !installed.contains(&skill_id) {
-            continue;
-        }
-        let diff = skill_directory_diff(
-            &skill_id,
-            &context.store.skill_dir(&skill_id),
-            &skill.directory,
-        )?;
-        if diff.changed {
-            return Ok(());
-        }
+    if !bundle.matches_installed_contents(context, &installed)? {
+        return Ok(());
     }
 
     let previous = lock.bundles.get(SELF_BUNDLE_ID).cloned();
@@ -2751,15 +2720,6 @@ fn refresh_self_bundle_receipt(
         .map(|record| record.enabled.clone())
         .unwrap_or_default();
     enabled.extend(agent_ids(agents));
-    let mut member_enabled = previous
-        .as_ref()
-        .map(|record| record.member_enabled.clone())
-        .unwrap_or_default();
-    for skill_id in &installed {
-        if let Some(record) = lock.skills.get(skill_id) {
-            member_enabled.insert(skill_id.clone(), record.enabled.clone());
-        }
-    }
     let mut excluded = previous
         .as_ref()
         .map(|record| record.excluded.clone())
@@ -2770,19 +2730,7 @@ fn refresh_self_bundle_receipt(
         excluded.remove(skill_id);
     }
     excluded.extend(members.difference(&installed).cloned());
-    lock.bundles.insert(
-        SELF_BUNDLE_ID.to_string(),
-        LockedBundleRecord {
-            release: env!("CARGO_PKG_VERSION").to_string(),
-            digest: self_bundle_digest(),
-            members,
-            excluded,
-            enabled,
-            member_enabled,
-        },
-    );
-    lock.write(&context.paths.lock_file())?;
-    Ok(())
+    bundle.write_receipt(context, lock, previous.as_ref(), excluded, enabled)
 }
 
 fn apply_install_candidate(
@@ -3591,14 +3539,30 @@ fn update(
         }
     }
 
-    let bundle_changes = if reconcile_bundle {
-        reconcile_self_bundle(context, &mut lock, requested_action, json_output)?
+    let bundle_changes = if reconcile_bundle || refresh_bundle_receipt {
+        let source = SourceInput::Bundled.into_spec()?;
+        let fetched = match fetched_checkouts.get(&SourceCheckoutKey::from(&source)) {
+            Some(Ok(checkout)) => resolve_fetched_source(&source, checkout)?,
+            _ => fetch_source_cached(&source, &context.paths.cache_dir.join("sources"))?,
+        };
+        let discovery = discover_skills_with_diagnostics(&fetched.root)?;
+        let bundle = SelfBundle::from_skills(&discovery.skills)?;
+        if reconcile_bundle {
+            reconcile_self_bundle(
+                context,
+                &mut lock,
+                &bundle,
+                &source,
+                requested_action,
+                json_output,
+            )?
+        } else {
+            refresh_self_bundle_receipt_if_converged(context, &mut lock, &bundle)?;
+            BundleReconcileResult::default()
+        }
     } else {
         BundleReconcileResult::default()
     };
-    if refresh_bundle_receipt {
-        refresh_self_bundle_receipt_if_converged(context, &mut lock)?;
-    }
     skipped.extend(bundle_changes.skipped);
     if !json_output
         && failed.is_empty()
@@ -3648,23 +3612,16 @@ struct BundleReconcileResult {
 fn reconcile_self_bundle(
     context: &ScopeContext,
     lock: &mut LockFile,
+    bundle: &SelfBundle<'_>,
+    source: &SourceSpec,
     requested_action: Option<ChangeAction>,
     json_output: bool,
 ) -> Result<BundleReconcileResult> {
     let Some(mut previous) = lock.bundles.get(SELF_BUNDLE_ID).cloned() else {
         anyhow::bail!("the `self` bundle is not acquired; run `yasm add self --action apply`");
     };
-    previous.member_enabled = bundle_member_enabled(lock, &previous);
-    let source = SourceInput::Bundled.into_spec()?;
-    let fetched = fetch_source_cached(&source, &context.paths.cache_dir.join("sources"))?;
-    let discovery = discover_skills_with_diagnostics(&fetched.root)?;
-    validate_self_bundle_manifest(&discovery.skills)?;
-    let current = discovery
-        .skills
-        .into_iter()
-        .map(|skill| Ok((sanitize_skill_id(&skill.name)?, skill)))
-        .collect::<yasm_core::Result<BTreeMap<_, _>>>()?;
-    let current_ids = current.keys().cloned().collect::<BTreeSet<_>>();
+    previous.member_enabled = bundle_member_enabled(lock, Some(&previous));
+    let current_ids = bundle.members();
     let acquired = acquired_self_member_ids(lock);
     let current_exclusions = previous.excluded.clone();
     let additions = current_ids
@@ -3750,9 +3707,9 @@ fn reconcile_self_bundle(
         }
 
         for skill_id in &additions {
-            let skill = current
-                .get(skill_id)
-                .expect("bundle additions originate from current skills");
+            let skill = bundle.skills.get(skill_id).ok_or_else(|| {
+                anyhow::anyhow!("bundle addition `{skill_id}` is missing from the current bundle")
+            })?;
             let enabled = bundle_member_agents(&previous, skill_id);
             let agents = enabled
                 .iter()
@@ -3762,7 +3719,7 @@ fn reconcile_self_bundle(
                 lock,
                 skill_id,
                 skill.name.clone(),
-                fetched.source.clone(),
+                source.clone(),
                 None,
                 skill.skill_path.clone(),
                 &skill.directory,
@@ -3787,20 +3744,14 @@ fn reconcile_self_bundle(
         }
     }
 
-    if self_bundle_is_converged(context, lock, &current, &current_exclusions)? {
-        let member_enabled = bundle_member_enabled(lock, &previous);
-        lock.bundles.insert(
-            SELF_BUNDLE_ID.to_string(),
-            LockedBundleRecord {
-                release: env!("CARGO_PKG_VERSION").to_string(),
-                digest: self_bundle_digest(),
-                members: current_ids,
-                excluded: current_exclusions,
-                enabled: previous.enabled,
-                member_enabled,
-            },
-        );
-        lock.write(&context.paths.lock_file())?;
+    if bundle.is_converged(context, lock, &current_exclusions)? {
+        bundle.write_receipt(
+            context,
+            lock,
+            Some(&previous),
+            current_exclusions,
+            previous.enabled.clone(),
+        )?;
     }
     Ok(result)
 }
@@ -3808,35 +3759,19 @@ fn reconcile_self_bundle(
 fn refresh_self_bundle_receipt_if_converged(
     context: &ScopeContext,
     lock: &mut LockFile,
+    bundle: &SelfBundle<'_>,
 ) -> Result<()> {
     let Some(previous) = lock.bundles.get(SELF_BUNDLE_ID).cloned() else {
         return Ok(());
     };
-    let source = SourceInput::Bundled.into_spec()?;
-    let fetched = fetch_source_cached(&source, &context.paths.cache_dir.join("sources"))?;
-    let discovery = discover_skills_with_diagnostics(&fetched.root)?;
-    validate_self_bundle_manifest(&discovery.skills)?;
-    let current = discovery
-        .skills
-        .into_iter()
-        .map(|skill| Ok((sanitize_skill_id(&skill.name)?, skill)))
-        .collect::<yasm_core::Result<BTreeMap<_, _>>>()?;
-    let current_ids = current.keys().cloned().collect::<BTreeSet<_>>();
-    let exclusions = previous.excluded.clone();
-    if self_bundle_is_converged(context, lock, &current, &exclusions)? {
-        let member_enabled = bundle_member_enabled(lock, &previous);
-        lock.bundles.insert(
-            SELF_BUNDLE_ID.to_string(),
-            LockedBundleRecord {
-                release: env!("CARGO_PKG_VERSION").to_string(),
-                digest: self_bundle_digest(),
-                members: current_ids,
-                excluded: exclusions,
-                enabled: previous.enabled,
-                member_enabled,
-            },
-        );
-        lock.write(&context.paths.lock_file())?;
+    if bundle.is_converged(context, lock, &previous.excluded)? {
+        bundle.write_receipt(
+            context,
+            lock,
+            Some(&previous),
+            previous.excluded.clone(),
+            previous.enabled.clone(),
+        )?;
     }
     Ok(())
 }
@@ -3847,53 +3782,6 @@ fn bundle_member_agents(previous: &LockedBundleRecord, new_id: &SkillId) -> BTre
         .get(new_id)
         .unwrap_or(&previous.enabled)
         .clone()
-}
-
-fn bundle_member_enabled(
-    lock: &LockFile,
-    previous: &LockedBundleRecord,
-) -> BTreeMap<SkillId, BTreeSet<AgentId>> {
-    let mut enabled = previous.member_enabled.clone();
-    for (skill_id, record) in &lock.skills {
-        if record.source.kind == SourceKind::Bundled && record.source.path == SELF_BUNDLE_ID {
-            enabled.insert(skill_id.clone(), record.enabled.clone());
-        }
-    }
-    enabled
-}
-
-fn self_bundle_is_converged(
-    context: &ScopeContext,
-    lock: &LockFile,
-    current: &BTreeMap<SkillId, DiscoveredSkill>,
-    excluded: &BTreeSet<SkillId>,
-) -> Result<bool> {
-    for (skill_id, skill) in current {
-        if excluded.contains(skill_id) {
-            if lock.skills.contains_key(skill_id) {
-                return Ok(false);
-            }
-            continue;
-        }
-        let Some(record) = lock.skills.get(skill_id) else {
-            return Ok(false);
-        };
-        if record.source.kind != SourceKind::Bundled || record.source.path != SELF_BUNDLE_ID {
-            return Ok(false);
-        }
-        if skill_directory_diff(
-            skill_id,
-            &context.store.skill_dir(skill_id),
-            &skill.directory,
-        )?
-        .changed
-        {
-            return Ok(false);
-        }
-    }
-    Ok(acquired_self_member_ids(lock)
-        .iter()
-        .all(|skill_id| current.contains_key(skill_id)))
 }
 
 fn check_update_candidate(
