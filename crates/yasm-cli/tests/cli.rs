@@ -7804,3 +7804,320 @@ fn incomplete_migration_journals_preserve_backups_and_store() {
         assert!(project.join(".yasm/skills/demo/SKILL.md").exists());
     }
 }
+
+fn agent_files_command(project: &Path, home: &Path, data: &Path) -> TestCommand {
+    let mut command = yasm_with_roots(data, home);
+    command.current_dir(project).env_remove("CODEX_HOME");
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_files_migration_preserves_root_files_and_leaves_skills_and_nested_files_alone() {
+    let project = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let data = tempdir().unwrap();
+    std::fs::create_dir(project.path().join(".yasm")).unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+    std::fs::create_dir_all(project.path().join(".agents/skills/demo")).unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), b"global\r\n\xff").unwrap();
+    std::fs::write(project.path().join("CLAUDE.md"), "claude instructions\n").unwrap();
+    std::fs::write(project.path().join("src/AGENTS.md"), "nested").unwrap();
+    std::fs::write(
+        project.path().join(".agents/skills/demo/SKILL.md"),
+        "---\nname: demo\ndescription: demo\n---\n",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let output = agent_files_command(project.path(), home.path(), data.path())
+            .args(["migrate", "--agent-files", "--action", "apply"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let original = project.path().join(name);
+        assert_eq!(
+            std::fs::read_link(&original).unwrap(),
+            Path::new(".yasm/agent-files").join(name)
+        );
+        assert_eq!(
+            std::fs::read(original).unwrap(),
+            std::fs::read(project.path().join(".yasm/agent-files").join(name)).unwrap()
+        );
+    }
+    assert_eq!(
+        std::fs::read(project.path().join("AGENTS.md")).unwrap(),
+        b"global\r\n\xff"
+    );
+    std::fs::write(project.path().join("AGENTS.md"), "edited").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".yasm/agent-files/AGENTS.md")).unwrap(),
+        "edited"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("src/AGENTS.md")).unwrap(),
+        "nested"
+    );
+    assert!(
+        std::fs::symlink_metadata(project.path().join(".agents/skills/demo"))
+            .unwrap()
+            .is_dir()
+    );
+    assert!(!project
+        .path()
+        .join(".yasm/agent-file-migration.json")
+        .exists());
+    assert!(!project.path().join(".yasm/yasm.lock").exists());
+}
+
+#[test]
+fn agent_files_review_and_missing_action_make_no_changes_and_show_conflicts() {
+    let project = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let data = tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".yasm/agent-files")).unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), "original").unwrap();
+    std::fs::write(project.path().join("CLAUDE.md"), "claude").unwrap();
+    std::fs::write(
+        project.path().join(".yasm/agent-files/AGENTS.md"),
+        "different",
+    )
+    .unwrap();
+    let review = agent_files_command(project.path(), home.path(), data.path())
+        .args(["migrate", "--agent-files", "--action", "review"])
+        .output()
+        .unwrap();
+    assert!(review.status.success());
+    let stdout = String::from_utf8_lossy(&review.stdout);
+    assert!(stdout.contains("CONFLICT"));
+    assert!(stdout.contains("relative symlink"));
+    for args in [
+        vec!["migrate", "--agent-files"],
+        vec!["migrate", "--agent-files", "--action", "apply"],
+    ] {
+        let output = agent_files_command(project.path(), home.path(), data.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--action"));
+    }
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("AGENTS.md")).unwrap(),
+        "original"
+    );
+    assert!(std::fs::symlink_metadata(project.path().join("CLAUDE.md"))
+        .unwrap()
+        .is_file());
+    assert!(!project.path().join(".yasm/agent-files/CLAUDE.md").exists());
+    assert!(!project
+        .path()
+        .join(".yasm/agent-file-migration.json")
+        .exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_files_adopts_identical_store_but_rejects_external_and_broken_symlinks() {
+    let project = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let data = tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".yasm/agent-files")).unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), "same").unwrap();
+    std::fs::write(project.path().join(".yasm/agent-files/AGENTS.md"), "same").unwrap();
+    let apply = agent_files_command(project.path(), home.path(), data.path())
+        .args(["migrate", "--agent-files", "--action", "apply"])
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "{}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let external = project.path().join("external.md");
+    std::fs::write(&external, "external").unwrap();
+    for target in [external, project.path().join("missing.md")] {
+        let claude = project.path().join("CLAUDE.md");
+        std::os::unix::fs::symlink(&target, &claude).unwrap();
+        let apply = agent_files_command(project.path(), home.path(), data.path())
+            .args(["migrate", "--agent-files", "--action", "apply"])
+            .output()
+            .unwrap();
+        assert!(!apply.status.success());
+        assert!(String::from_utf8_lossy(&apply.stderr).contains("symlink"));
+        assert_eq!(std::fs::read_link(&claude).unwrap(), target);
+        std::fs::remove_file(claude).unwrap();
+    }
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("external.md")).unwrap(),
+        "external"
+    );
+    let store = project.path().join(".yasm/agent-files/AGENTS.md");
+    std::fs::remove_file(store).unwrap();
+    let broken = agent_files_command(project.path(), home.path(), data.path())
+        .args(["migrate", "--agent-files", "--action", "apply"])
+        .output()
+        .unwrap();
+    assert!(!broken.status.success());
+    assert!(std::fs::symlink_metadata(project.path().join("AGENTS.md"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn global_agent_files_respect_codex_home_and_symlinked_configuration_parents() {
+    let project = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let data = tempdir().unwrap();
+    let external = tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+    std::fs::write(home.path().join(".codex/AGENTS.md"), "default ignored").unwrap();
+    let codex = external.path().join("profile");
+    std::fs::create_dir(&codex).unwrap();
+    std::fs::write(codex.join("AGENTS.md"), "codex").unwrap();
+    std::fs::write(codex.join("AGENTS.override.md"), "override").unwrap();
+    let physical_claude = external.path().join("configuration/claude");
+    std::fs::create_dir_all(&physical_claude).unwrap();
+    std::fs::write(physical_claude.join("CLAUDE.md"), "claude").unwrap();
+    std::os::unix::fs::symlink(&physical_claude, home.path().join(".claude")).unwrap();
+    for action in ["review", "apply", "apply"] {
+        let output = agent_files_command(project.path(), home.path(), data.path())
+            .env("CODEX_HOME", &codex)
+            .args(["migrate", "--agent-files", "--global", "--action", action])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("AGENTS.override.md"));
+        if action == "review" {
+            assert!(!data.path().join("agent-files").exists());
+        }
+    }
+    for source in [
+        codex.join("AGENTS.md"),
+        home.path().join(".claude/CLAUDE.md"),
+    ] {
+        assert!(std::fs::read_link(&source).unwrap().is_relative());
+        assert_eq!(
+            std::fs::canonicalize(&source).unwrap(),
+            std::fs::canonicalize(
+                data.path()
+                    .join("agent-files")
+                    .join(source.file_name().unwrap())
+            )
+            .unwrap()
+        );
+    }
+    assert_eq!(
+        std::fs::read_link(home.path().join(".claude")).unwrap(),
+        physical_claude
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.path().join(".codex/AGENTS.md")).unwrap(),
+        "default ignored"
+    );
+    assert_eq!(
+        std::fs::read_to_string(codex.join("AGENTS.override.md")).unwrap(),
+        "override"
+    );
+}
+
+#[test]
+fn global_agent_files_discover_defaults_and_skip_missing_files_without_creating_store() {
+    let project = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let data = tempdir().unwrap();
+    let empty = agent_files_command(project.path(), home.path(), data.path())
+        .args(["migrate", "--agent-files", "--global", "--action", "apply"])
+        .output()
+        .unwrap();
+    assert!(empty.status.success());
+    assert!(!data.path().join("agent-files").exists());
+    std::fs::create_dir(home.path().join(".codex")).unwrap();
+    std::fs::write(home.path().join(".codex/AGENTS.md"), "default").unwrap();
+    let review = agent_files_command(project.path(), home.path(), data.path())
+        .args(["migrate", "--agent-files", "--global", "--action", "review"])
+        .output()
+        .unwrap();
+    assert!(review.status.success());
+    assert!(String::from_utf8_lossy(&review.stdout).contains("AGENTS.md"));
+    assert!(!data.path().join("agent-files").exists());
+}
+
+#[test]
+fn agent_files_flag_rejects_skill_specific_options() {
+    for option in [
+        vec!["--skill", "demo"],
+        vec!["--source", "local"],
+        vec!["--with-upstream"],
+    ] {
+        let output = yasm()
+            .args(["migrate", "--agent-files", "--action", "review"])
+            .args(option)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn interactive_agent_files_migration_offers_review_and_apply() {
+    let project = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let data = tempdir().unwrap();
+    std::fs::create_dir(project.path().join(".yasm")).unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), "instructions").unwrap();
+    for apply in [false, true] {
+        let mut command = agent_files_command(project.path(), home.path(), data.path());
+        command.args(["migrate", "--agent-files"]);
+        let TestCommand { command, _sandbox } = command;
+        let mut session = Session::spawn(command).unwrap();
+        session
+            .expect("Choose an agent-file migration action")
+            .unwrap();
+        if apply {
+            session.send("\x1b[B").unwrap();
+        }
+        session.send_line("").unwrap();
+        session.expect(Eof).unwrap();
+        let status = session.get_process().wait().unwrap();
+        assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+        assert_eq!(
+            std::fs::symlink_metadata(project.path().join("AGENTS.md"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            apply
+        );
+    }
+}
+
+#[test]
+fn skill_migration_does_not_adopt_agent_files_without_flag() {
+    let project = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let data = tempdir().unwrap();
+    std::fs::create_dir(project.path().join(".yasm")).unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), "instructions").unwrap();
+    let output = agent_files_command(project.path(), home.path(), data.path())
+        .args(["migrate", "--action", "apply"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(std::fs::symlink_metadata(project.path().join("AGENTS.md"))
+        .unwrap()
+        .is_file());
+    assert!(!project.path().join(".yasm/agent-files").exists());
+}

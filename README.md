@@ -225,6 +225,55 @@ There is no automatic upgrade of older development state. Recreate unsupported
 state with the current executable; keep skill files and any recovery backups
 until that is complete.
 
+### Adopt existing agent files
+
+Use `--agent-files` to migrate complete instruction files instead of skills:
+
+```bash
+yasm migrate --agent-files --action review
+yasm migrate --agent-files --action apply
+yasm migrate --agent-files --global --action apply
+```
+
+Project migration uses the nearest initialized `.yasm/` project store and adopts
+only `AGENTS.md` and `CLAUDE.md` at that project's root. Run `yasm init
+--no-migrate` first for a new project. Without a project store, migration uses
+the global scope, as it does for skills. Nested instruction files, project
+`.claude/CLAUDE.md`, and composition are not supported yet.
+
+Global migration discovers `~/.codex/AGENTS.md` (or `AGENTS.md` under
+`CODEX_HOME`) and `~/.claude/CLAUDE.md`. It reports an existing
+`AGENTS.override.md`, which Codex prefers over `AGENTS.md`, but does not migrate
+that override.
+
+Files retain their names and exact contents under `.yasm/agent-files/` for
+projects or `agent-files/` in the existing global data store (including
+`YASM_DATA_DIR` overrides). No `root/` subdirectory is added. Each original
+location becomes a relative symlink, so editing the original path edits the
+stored file. Commit the stored project files and their links together so a clone
+can use them without Yasm. Agent files remain separate from skill lock records
+and skill listing, update, and removal commands.
+
+Review is read-only and shows destinations, links, missing or already-managed
+files, and conflicts. Apply adopts identical stored copies, rejects differing
+contents, and never creates empty files for missing candidates. File symlinks
+pointing outside the managed store, broken links, and non-file paths are reported
+as conflicts. Global configuration directory symlinks are preserved; relative
+file links are calculated from the resolved parent directory.
+
+`--agent-files` cannot be combined with `--skill`, `--source`, or
+`--with-upstream`. Non-TTY usage requires `--action review` or `--action apply`;
+a terminal can prompt for either action.
+
+Migration journals changes and retains original-file backups until commit. After
+an interruption, review leaves recovery state untouched; run the same command
+with `--action apply`, the original scope, and the original `CODEX_HOME` to
+recover and retry. Recovery refuses to overwrite externally changed paths or
+contents and preserves backups for inspection. Skill mutations are blocked while
+an agent-file migration is pending. To restore an ordinary file manually, copy
+the stored contents to a temporary file beside the original link, then replace
+the link with that file; retain the stored copy until restoration is verified.
+
 ### Manage plugin marketplaces (experimental)
 
 **Marketplace and plugin support is experimental.** Commands, behavior, and
