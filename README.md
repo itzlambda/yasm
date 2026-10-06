@@ -127,7 +127,7 @@ Add and update reuse a repository cache shared across project and global scopes.
 Commit snapshots keep source files stable during review and installation.
 Installed files are independent of this cache, so deleting it does not remove
 installed skills. Fetching a newer commit does not update receipts or contents
-for unselected skills.
+for unchecked skills.
 
 ### Private repositories over SSH
 
@@ -178,6 +178,12 @@ yasm remove frontend-design --all
 In a terminal, use `yasm update frontend-design --action review` to review the
 changes and choose whether to apply them. Skills with no upstream source are
 locally owned and are not checked for updates.
+
+Only skills whose installed contents differ from upstream enter update selection
+and review. When checked contents already match, yasm automatically refreshes the
+recorded source revision, preserves installed files and agent enablement, and
+reports `no changes`. JSON output lists these receipts in `revision_recorded`,
+separately from content changes in `updated`.
 
 ### Inspect and repair your setup
 

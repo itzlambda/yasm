@@ -3561,6 +3561,7 @@ fn update(
     }
     let selected_count = selected.len();
     let mut candidates = Vec::new();
+    let mut revision_recorded = Vec::new();
     let mut unchanged = Vec::new();
     let mut failed = Vec::new();
     let mut not_checked = Vec::new();
@@ -3610,6 +3611,10 @@ fn update(
             )),
         };
         match result {
+            Ok(Some(candidate)) if !candidate.diff.changed => {
+                apply_update_candidate(context, &mut lock, candidate, &[], json_output)?;
+                revision_recorded.push(skill_id.to_string());
+            }
             Ok(Some(candidate)) => candidates.push(candidate),
             Ok(None) => unchanged.push(skill_id.to_string()),
             Err(error) => record_update_check_failure(
@@ -3635,7 +3640,6 @@ fn update(
         select_update_candidates(candidates, !skills.is_empty())?
     };
     let mut updated = Vec::new();
-    let mut revision_recorded = Vec::new();
     let mut skipped = Vec::new();
 
     if !candidates.is_empty() {
@@ -3653,15 +3657,10 @@ fn update(
             }
 
             let updated_skill_id = candidate.skill_id.to_string();
-            let metadata_only = !candidate.diff.changed;
             apply_update_candidate(context, &mut lock, candidate, &[], json_output)?;
-            if metadata_only {
-                revision_recorded.push(updated_skill_id);
-            } else {
-                updated.push(updated_skill_id.clone());
-                if !json_output {
-                    println!("updated {updated_skill_id}");
-                }
+            updated.push(updated_skill_id.clone());
+            if !json_output {
+                println!("updated {updated_skill_id}");
             }
         }
     }
@@ -3694,7 +3693,6 @@ fn update(
     if !json_output
         && failed.is_empty()
         && updated.is_empty()
-        && revision_recorded.is_empty()
         && bundle_changes.added.is_empty()
         && bundle_changes.retired.is_empty()
         && skipped.is_empty()

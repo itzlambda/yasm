@@ -5777,18 +5777,6 @@ fn migrate_manual_source_preserves_files_and_first_update_records_revision() {
     assert_eq!(lock["skills"]["demo"]["source"]["subpath"], "skills/demo");
     assert!(lock["skills"]["demo"].get("resolved").is_none());
 
-    let mut skip = yasm();
-    skip.current_dir(&project);
-    redirect_github(&mut skip, remote.path());
-    let skipped = skip
-        .args(["update", "demo", "--action", "skip"])
-        .output()
-        .unwrap();
-    assert!(skipped.status.success());
-    assert!(String::from_utf8_lossy(&skipped.stdout).contains("skipped demo"));
-    let lock: Value = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
-    assert!(lock["skills"]["demo"].get("resolved").is_none());
-
     let mut apply = yasm();
     apply.current_dir(&project);
     redirect_github(&mut apply, remote.path());
@@ -5872,6 +5860,7 @@ fn update_review_records_unpinned_revision_without_prompt() {
         String::from_utf8_lossy(&reviewed.stderr)
     );
     let stdout = String::from_utf8_lossy(&reviewed.stdout);
+    assert_eq!(stdout, "no changes\n");
     assert!(!stdout.contains("recorded revision"));
     assert!(!stdout.contains("Record verified revision"));
     assert!(!stdout.contains("verified revision available"));
@@ -9071,5 +9060,219 @@ fn repeated_add_supports_relative_cache_directories() {
             .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_dir())
             .count(),
         1
+    );
+}
+
+#[test]
+fn update_records_revision_only_changes_in_shared_and_separate_repositories() {
+    for separate in [false, true] {
+        let data = tempdir().unwrap();
+        let agents = tempdir().unwrap();
+        let remote = repeated_add_repository();
+        let other = repeated_add_repository();
+        let research_remote = if separate {
+            other.path()
+        } else {
+            remote.path()
+        };
+        let command = || {
+            let mut command = repeated_add_command(data.path(), agents.path(), remote.path());
+            command
+                .env("GIT_CONFIG_COUNT", "2")
+                .env(
+                    "GIT_CONFIG_KEY_1",
+                    format!("url.file://{}.insteadOf", research_remote.display()),
+                )
+                .env("GIT_CONFIG_VALUE_1", "https://github.com/owner/other.git");
+            command
+        };
+        for (skill, source) in [("retro", "owner/repo"), ("research", "owner/other")] {
+            let output = command()
+                .args([
+                    "add", source, "--skill", skill, "--agent", "claude", "--action", "apply",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let initial = installation_receipts(data.path());
+        let installed = std::fs::read(data.path().join("skills/retro/SKILL.md")).unwrap();
+        let installed_metadata =
+            std::fs::metadata(data.path().join("skills/retro/SKILL.md")).unwrap();
+        for root in if separate {
+            vec![remote.path(), other.path()]
+        } else {
+            vec![remote.path()]
+        } {
+            std::fs::write(root.join("README.md"), "unrelated change\n").unwrap();
+            git(root, &["add", "."]);
+            git(root, &["commit", "-m", "unrelated"]);
+        }
+        // No explicit skills or action: revision-only checks must bypass both prompts.
+        let output = command().arg("update").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"no changes\n");
+        let refreshed = installation_receipts(data.path());
+        for skill in ["retro", "research"] {
+            assert_ne!(
+                initial["skills"][skill]["resolved"],
+                refreshed["skills"][skill]["resolved"]
+            );
+            assert_eq!(
+                initial["skills"][skill]["enabled"],
+                refreshed["skills"][skill]["enabled"]
+            );
+            assert!(std::fs::symlink_metadata(
+                agents.path().join(format!(".claude/skills/{skill}"))
+            )
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        }
+        assert_eq!(
+            std::fs::read(data.path().join("skills/retro/SKILL.md")).unwrap(),
+            installed
+        );
+        assert_eq!(
+            std::fs::metadata(data.path().join("skills/retro/SKILL.md"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            installed_metadata.modified().unwrap()
+        );
+
+        write_skill(remote.path(), "skills/retro", "retro", "retro", "new body");
+        git(remote.path(), &["add", "."]);
+        git(remote.path(), &["commit", "-m", "change retro"]);
+        if separate {
+            std::fs::write(other.path().join("README.md"), "another unrelated change\n").unwrap();
+            git(other.path(), &["add", "."]);
+            git(other.path(), &["commit", "-m", "unrelated again"]);
+        }
+        // Revision recording happens even when a changed skill is skipped.
+        let output = command()
+            .args(["update", "retro", "research", "--action", "skip", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(summary["updated"], serde_json::json!([]));
+        assert_eq!(
+            summary["revision_recorded"],
+            serde_json::json!(["research"])
+        );
+        assert_eq!(summary["skipped"], serde_json::json!(["retro"]));
+        assert_eq!(
+            installation_receipts(data.path())["skills"]["retro"],
+            refreshed["skills"]["retro"]
+        );
+        assert_eq!(
+            std::fs::read(data.path().join("skills/retro/SKILL.md")).unwrap(),
+            installed
+        );
+
+        let output = command().args(["update", "research"]).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"no changes\n");
+        let output = command()
+            .args(["update", "retro", "--action", "apply", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(summary["updated"], serde_json::json!(["retro"]));
+        assert_eq!(summary["revision_recorded"], serde_json::json!([]));
+
+        // Matching source commits must still compare local edits and missing files.
+        for missing in [false, true] {
+            let path = data.path().join("skills/retro/SKILL.md");
+            if missing {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::write(&path, "local edit\n").unwrap();
+            }
+            let receipts = installation_receipts(data.path());
+            let output = command()
+                .args(["update", "retro", "--action", "review"])
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stdout)
+                .contains("diff -- installed/retro/SKILL.md"));
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("missing input for update confirmation"));
+            assert_eq!(installation_receipts(data.path()), receipts);
+            if missing {
+                assert!(!path.exists());
+            } else {
+                assert_eq!(std::fs::read_to_string(path).unwrap(), "local edit\n");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn update_selection_reviews_only_changed_skill_and_decline_preserves_receipt() {
+    let data = tempdir().unwrap();
+    let agents = tempdir().unwrap();
+    let remote = repeated_add_repository();
+    for skill in ["retro", "research"] {
+        let installed = repeated_add_command(data.path(), agents.path(), remote.path())
+            .args([
+                "add",
+                "owner/repo",
+                "--skill",
+                skill,
+                "--agent",
+                "claude",
+                "--action",
+                "apply",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+    }
+    let initial = installation_receipts(data.path());
+    write_skill(remote.path(), "skills/retro", "retro", "retro", "new body");
+    git(remote.path(), &["add", "."]);
+    git(remote.path(), &["commit", "-m", "change retro"]);
+    let mut command = repeated_add_command(data.path(), agents.path(), remote.path());
+    command.args(["update", "--action", "review"]);
+    let TestCommand { command, _sandbox } = command;
+    let mut session = Session::spawn(command).unwrap();
+    session.expect("Select skills to update").unwrap();
+    session.send_line("").unwrap();
+    let selection = session.expect("Apply update for retro?").unwrap();
+    assert!(!String::from_utf8_lossy(selection.before()).contains("research"));
+    session.send_line("n").unwrap();
+    session.expect("skipped retro").unwrap();
+    session.expect(Eof).unwrap();
+    assert!(matches!(
+        session.get_process().wait().unwrap(),
+        WaitStatus::Exited(_, 0)
+    ));
+    let receipts = installation_receipts(data.path());
+    assert_eq!(receipts["skills"]["retro"], initial["skills"]["retro"]);
+    assert_ne!(
+        receipts["skills"]["research"]["resolved"],
+        initial["skills"]["research"]["resolved"]
+    );
+    assert!(
+        std::fs::read_to_string(data.path().join("skills/retro/SKILL.md"))
+            .unwrap()
+            .contains("original")
     );
 }
