@@ -94,6 +94,41 @@ yasm migrate --skill team-review --source local --action apply
 
 See `yasm migrate --help` for source selection and filtering options.
 
+### Add more skills from a source
+
+Running `yasm add` again shows already-installed skills in a separate checked
+list and offers only additional skills in the picker. If every discovered skill
+is installed in the selected scope, the command exits without prompting. Adding
+skills preserves existing sibling skills and their agent settings.
+
+Select an installed skill explicitly to refresh its contents or repair missing
+files and managed links:
+
+```bash
+yasm add owner/repo --skill retro --action apply
+```
+
+When multiple skills share a name, pass their repository-relative `SKILL.md`
+path to `--skill` to choose one explicitly.
+
+A skill ID already acquired from a different source requires `--replace`:
+
+```bash
+yasm add another/repo --skill retro --replace --action apply
+```
+
+GitHub shorthand and repository URLs share the same source identity. Skill paths
+in installation receipts are relative to the repository root, including when
+installation starts from a subdirectory URL. Default-branch sources continue to
+follow the remote default branch; explicitly selected branches and tags retain
+their requested ref.
+
+Add and update reuse a repository cache shared across project and global scopes.
+Commit snapshots keep source files stable during review and installation.
+Installed files are independent of this cache, so deleting it does not remove
+installed skills. Fetching a newer commit does not update receipts or contents
+for unselected skills.
+
 ### Private repositories over SSH
 
 Use an SCP-style Git address to install skills from a private repository:

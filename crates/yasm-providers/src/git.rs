@@ -6,15 +6,14 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use camino::Utf8Path;
-use sha2::{Digest, Sha256};
-use yasm_core::{Error, ResolvedSource, Result, SourceKind, SourceSpec};
+use camino::{Utf8Path, Utf8PathBuf};
+use yasm_core::{Error, GitRef, ResolvedSource, Result, SourceKind, SourceSpec};
 
 use crate::{cache_key, FetchedCheckout};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Keep a managed checkout locked while callers inspect or copy its contents.
+/// Serialize repository acquisition and snapshot publication.
 #[derive(Debug, Clone)]
 pub struct CheckoutLease {
     _file: Arc<LockedCheckout>,
@@ -50,7 +49,7 @@ fn checkout_lease(cache_dir: &Utf8Path, key: &str) -> Result<CheckoutLease> {
 
 #[cfg(all(test, unix))]
 mod checkout_lease_tests {
-    use super::*;
+    use crate::git::*;
 
     #[test]
     fn final_reader_unlocks_even_while_an_inherited_descriptor_remains_open() {
@@ -153,7 +152,11 @@ impl std::str::FromStr for GitRemote {
                 return Err(invalid());
             }
             return Ok(Self {
-                address: format!("https://github.com/{}/{repository}.git", parts[0]),
+                address: format!(
+                    "https://github.com/{}/{}.git",
+                    parts[0].to_ascii_lowercase(),
+                    repository.to_ascii_lowercase()
+                ),
                 transport: GitTransport::Https,
             });
         }
@@ -214,31 +217,13 @@ pub fn fetch_checkout(source: &SourceSpec, destination: &Utf8Path) -> Result<Fet
     })
 }
 
+/// Fetch into one repository per remote, then publish an immutable commit snapshot.
+/// Repository locks cover acquisition only; readers never hold a mutable checkout.
 pub fn fetch_checkout_cached(source: &SourceSpec, cache_dir: &Utf8Path) -> Result<FetchedCheckout> {
-    std::fs::create_dir_all(cache_dir).map_err(|err| {
-        Error::Message(format!(
-            "failed to create source cache {}: {err}",
-            cache_dir
-        ))
-    })?;
-    let key = cache_key(source);
-    let lease = checkout_lease(cache_dir, &key)?;
-    let destination = cache_dir.join(key);
-    if managed_checkout_exists(&destination)? {
-        update_cached_git(source, &destination)?;
-    } else {
-        fetch_checkout(source, &destination)?;
-    }
-
-    let resolved = resolve_git_source(source, &destination)?;
-    Ok(FetchedCheckout {
-        root: destination,
-        resolved: Some(resolved),
-        lease: Some(lease),
-    })
+    cached_snapshot(source, None, cache_dir)
 }
 
-/// Fetch a full commit pin into the caller's pinned-checkout cache.
+/// Fetch a full commit pin through the same repository and snapshot machinery.
 pub fn fetch_pinned_checkout(
     source: &SourceSpec,
     sha: &str,
@@ -249,47 +234,108 @@ pub fn fetch_pinned_checkout(
             "invalid Git commit pin `{sha}`; expected a full 40-character commit SHA"
         )));
     }
-    let key = format!(
-        "{:x}",
-        Sha256::digest(format!("{}\0{sha}", source.path).as_bytes())
-    );
-    std::fs::create_dir_all(cache_dir).map_err(|error| yasm_core::error::io(cache_dir, error))?;
-    let lease = checkout_lease(cache_dir, &key)?;
-    let destination = cache_dir.join(key);
-    if !managed_checkout_exists(&destination)? {
+    cached_snapshot(source, Some(sha), cache_dir)
+}
+
+fn cached_snapshot(
+    source: &SourceSpec,
+    pin: Option<&str>,
+    cache_dir: &Utf8Path,
+) -> Result<FetchedCheckout> {
+    let repositories = cache_dir.join("repositories");
+    std::fs::create_dir_all(&repositories)
+        .map_err(|error| yasm_core::error::io(&repositories, error))?;
+    let key = cache_key(source);
+    let _lease = checkout_lease(&repositories, &key)?;
+    let repository = repositories.join(&key);
+    if !managed_checkout_exists(&repository)? {
         let mut clone = git_command();
         clone
-            .args([
-                "clone",
-                "--no-checkout",
-                "--filter=blob:none",
-                "--",
-                &source.path,
-            ])
-            .arg(&destination);
-        if let Err(error) = run_git(clone, source, "clone pinned plugin source") {
-            let _ = std::fs::remove_dir_all(&destination);
+            .args(["clone", "--no-checkout", "--", &source.path])
+            .arg(&repository);
+        if let Err(error) = run_git(clone, source, "git clone") {
+            let _ = std::fs::remove_dir_all(&repository);
             return Err(error);
         }
     }
+
+    let git_ref = match (&source.r#ref, pin) {
+        (_, Some(_)) => source.r#ref.clone(),
+        (Some(git_ref), None) => Some(git_ref.clone()),
+        (None, None) => Some(remote_default_ref(source, &repository)?),
+    };
+    let target = pin
+        .or_else(|| git_ref.as_ref().map(GitRef::as_str))
+        .ok_or_else(|| Error::Message("could not resolve Git source ref".to_string()))?;
     let mut fetch = git_command();
     fetch
         .arg("-C")
-        .arg(&destination)
-        .args(["fetch", "--depth", "1", "origin", sha]);
-    run_git(fetch, source, "fetch pinned plugin commit")?;
-    let mut checkout = git_command();
-    checkout
+        .arg(&repository)
+        .args(["fetch", "origin", target]);
+    run_git(fetch, source, "git fetch")?;
+    let mut resolve = git_command();
+    resolve
         .arg("-C")
-        .arg(&destination)
-        .args(["checkout", "--detach", "--force", sha]);
-    run_git(checkout, source, "check out pinned plugin commit")?;
-    let resolved = resolve_git_source(source, &destination)?;
+        .arg(&repository)
+        .args(["rev-parse", "FETCH_HEAD^{commit}"]);
+    let commit = git_stdout(resolve, source, "resolve fetched commit")?
+        .trim()
+        .to_string();
+    let snapshots = cache_dir.join("snapshots").join(&key);
+    std::fs::create_dir_all(&snapshots).map_err(|error| yasm_core::error::io(&snapshots, error))?;
+    let destination = snapshots.join(&commit);
+    if !managed_checkout_exists(&destination)? {
+        // Stage completely before publishing. An interrupted command cannot leave
+        // a half-materialized snapshot that a later reader would accept.
+        let staging = tempfile::Builder::new()
+            .prefix(".snapshot-")
+            .tempdir_in(&snapshots)
+            .map_err(|error| yasm_core::error::io(&snapshots, error))?;
+        let staging_root = Utf8PathBuf::from_path_buf(staging.path().to_path_buf())
+            .map_err(|path| Error::NonUtf8Path(path.display().to_string()))?;
+        let checkout = staging_root.join("checkout");
+        let mut clone = git_command();
+        clone
+            .args(["clone", "--shared", "--no-checkout", "--"])
+            .arg(&repository)
+            .arg(&checkout);
+        run_git(clone, source, "materialize Git snapshot")?;
+        let mut detach = git_command();
+        detach
+            .arg("-C")
+            .arg(&checkout)
+            .args(["checkout", "--detach", &commit]);
+        run_git(detach, source, "check out Git snapshot")?;
+        std::fs::rename(&checkout, &destination)
+            .map_err(|error| yasm_core::error::io(&destination, error))?;
+    }
     Ok(FetchedCheckout {
         root: destination,
-        resolved: Some(resolved),
-        lease: Some(lease),
+        resolved: Some(ResolvedSource {
+            r#ref: git_ref,
+            commit,
+        }),
+        lease: None,
     })
+}
+
+fn remote_default_ref(source: &SourceSpec, repository: &Utf8Path) -> Result<GitRef> {
+    let mut command = git_command();
+    command
+        .arg("-C")
+        .arg(repository)
+        .args(["ls-remote", "--symref", "origin", "HEAD"]);
+    let output = git_stdout(command, source, "resolve remote default branch")?;
+    let branch = output
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("ref: refs/heads/")
+                .and_then(|line| line.strip_suffix("\tHEAD"))
+        })
+        .ok_or_else(|| {
+            Error::Message("remote HEAD does not identify a default branch".to_string())
+        })?;
+    GitRef::parse(branch)
 }
 
 fn resolve_git_source(source: &SourceSpec, destination: &Utf8Path) -> Result<ResolvedSource> {
@@ -297,8 +343,7 @@ fn resolve_git_source(source: &SourceSpec, destination: &Utf8Path) -> Result<Res
     command
         .arg("-C")
         .arg(destination)
-        .arg("rev-parse")
-        .arg("HEAD");
+        .args(["rev-parse", "HEAD"]);
     let commit = git_stdout(command, source, "git rev-parse")?;
     Ok(ResolvedSource {
         r#ref: source.r#ref.clone(),
@@ -306,46 +351,13 @@ fn resolve_git_source(source: &SourceSpec, destination: &Utf8Path) -> Result<Res
     })
 }
 
-fn update_cached_git(source: &SourceSpec, destination: &Utf8Path) -> Result<()> {
-    let ref_name = source.r#ref.as_ref().map(|git_ref| git_ref.as_str());
-    let mut fetch = git_command();
-    fetch
-        .arg("-C")
-        .arg(destination)
-        .arg("fetch")
-        .arg("--depth")
-        .arg("1")
-        .arg("origin");
-    if let Some(ref_name) = ref_name {
-        fetch.arg(ref_name);
-    }
-    run_git(fetch, source, "git fetch")?;
-
-    let checkout_target = if ref_name.is_some() {
-        "FETCH_HEAD"
-    } else {
-        "origin/HEAD"
-    };
-    let mut checkout = git_command();
-    checkout
-        .arg("-C")
-        .arg(destination)
-        .arg("checkout")
-        .arg("--force")
-        .arg(checkout_target);
-    run_git(checkout, source, "git checkout")?;
-
-    let mut clean = git_command();
-    clean.arg("-C").arg(destination).arg("clean").arg("-fdx");
-    run_git(clean, source, "git clean")?;
-    Ok(())
-}
-
 fn git_command() -> Command {
     let mut command = Command::new("git");
     command
         .arg("-c")
         .arg("credential.helper=")
+        .arg("-c")
+        .arg("gc.auto=0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never");
     command
@@ -368,7 +380,7 @@ fn git_stdout(command: Command, source: &SourceSpec, action: &str) -> Result<Str
 }
 
 fn run_git_output(mut command: Command, source: &SourceSpec, action: &str) -> Result<Output> {
-    if source.kind == SourceKind::Git {
+    if source.kind == SourceKind::Git && uses_remote_transport(&command) {
         let remote: GitRemote = source.path.parse()?;
         if remote.transport() == GitTransport::Ssh {
             let clone_context = clone_destination(&command)
@@ -382,6 +394,24 @@ fn run_git_output(mut command: Command, source: &SourceSpec, action: &str) -> Re
     }
     run_command_with_timeout(command, GIT_TIMEOUT)
         .map_err(|error| command_error(error, source, action))
+}
+
+// Snapshot materialization is local and must not consult SSH credentials or
+// inherit a different caller's transport settings after the fetch succeeded.
+fn uses_remote_transport(command: &Command) -> bool {
+    let mut arguments = command.get_args();
+    while let Some(option) = arguments.next() {
+        if option == "-c" || option == "-C" {
+            arguments.next();
+        } else {
+            return match option.to_str() {
+                Some("clone") => !arguments.any(|argument| argument == "--shared"),
+                Some("fetch" | "ls-remote") => true,
+                _ => false,
+            };
+        }
+    }
+    false
 }
 
 fn clone_destination(command: &Command) -> Option<&std::ffi::OsStr> {

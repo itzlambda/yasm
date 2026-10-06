@@ -1,3 +1,4 @@
+mod add_plan;
 mod binary_update;
 mod terminal_diff;
 
@@ -136,7 +137,7 @@ enum Command {
         source: SourceInput,
         #[arg(
             long,
-            help = "Skill name to acquire when the source contains multiple skills"
+            help = "Skill name or repository-relative SKILL.md path to install, refresh, or repair"
         )]
         skill: Option<String>,
         #[arg(
@@ -155,7 +156,7 @@ enum Command {
         action: Option<ChangeAction>,
         #[arg(
             long,
-            help = "Replace existing unmanaged agent skill directories with managed links"
+            help = "Replace a different upstream source or unmanaged agent skill directories"
         )]
         replace: bool,
     },
@@ -2392,21 +2393,21 @@ fn add(
     requested_action: Option<ChangeAction>,
     replace: bool,
 ) -> Result<()> {
-    let source = source_input.into_spec()?;
+    let mut source = source_input.into_spec()?;
     let bundled = source.kind == SourceKind::Bundled;
     if bundled && skill_selection.is_some() {
         anyhow::bail!(
             "the `self` bundle is installed as a unit; remove `--skill` and run `yasm add self`"
         );
     }
-    let temp = tempdir()?;
+    let mut lock = LockFile::read(&context.paths.lock_file())?;
     let progress = progress::Progress::start("Fetching source ...", false);
-    let fetched = fetch_source(&source, &utf8_temp_path(&temp)?)?;
+    let fetched = fetch_source_cached(&source, &context.paths.cache_dir.join("sources"))?;
     progress.set_message("Discovering skills ...");
     let discovery = discover_skills_with_diagnostics(&fetched.root)?;
     warn_skipped_skills(&progress, &discovery.skipped);
     progress.finish_and_clear();
-    let discovered = discovery.skills;
+    let mut discovered = discovery.skills;
     if discovered.is_empty() {
         if let Some(subpath) = &source.subpath {
             anyhow::bail!(
@@ -2418,14 +2419,49 @@ fn add(
     if bundled {
         validate_self_bundle_manifest(&discovered)?;
     }
-    let skills = if bundled {
-        discovered.iter().collect()
+    // Receipts use repository-relative paths, regardless of the discovery filter.
+    for skill in &mut discovered {
+        skill.skill_path = add_plan::repository_skill_path(&source, &skill.skill_path)?;
+    }
+    source.subpath = None;
+    let plan = add_plan::plan_skills(&discovered, &source, fetched.resolved.as_ref(), &lock)?;
+    let selected = if bundled {
+        plan.iter().collect::<Vec<_>>()
     } else {
-        select_skills(&discovered, skill_selection)?
+        select_add_skills(&plan, skill_selection)?
     };
+    let skills = selected
+        .iter()
+        .map(|planned| planned.skill)
+        .collect::<Vec<_>>();
+    if skills.is_empty() {
+        return Ok(());
+    }
     validate_reserved_skill_ids(&skills, bundled)?;
+    let mut selected_ids = BTreeMap::new();
+    for planned in &selected {
+        if let Some(previous) =
+            selected_ids.insert(&planned.skill_id, planned.skill.skill_path.as_str())
+        {
+            anyhow::bail!("selected skills share installation ID `{}`; conflicting paths: {previous}, {}; choose one with --skill <name-or-path>",
+                planned.skill_id, planned.skill.skill_path.as_str());
+        }
+    }
+    if requested_action != Some(ChangeAction::Skip) {
+        for planned in &selected {
+            if planned.state == add_plan::AddSkillState::Conflict && !replace && !bundled {
+                let existing = lock
+                    .skills
+                    .get(&planned.skill_id)
+                    .context("planned source conflict has no installation receipt")?;
+                anyhow::bail!(
+                    "skill `{}` is already acquired from {} at `{}`; pass --replace to replace its upstream source",
+                    planned.skill_id, display_source_root(existing), existing.skill_path.as_str()
+                );
+            }
+        }
+    }
     let agents = select_add_agents(&context.registry, agent_filter, no_enable)?;
-    let mut lock = LockFile::read(&context.paths.lock_file())?;
 
     if bundled {
         for skill in &skills {
@@ -2456,8 +2492,9 @@ fn add(
 
     let mut managed_candidates = Vec::new();
     let mut install_candidates = Vec::new();
-    for skill in skills {
-        let skill_id = sanitize_skill_id(&skill.name)?;
+    for planned in selected {
+        let skill = planned.skill;
+        let skill_id = planned.skill_id.clone();
         let replacements = add_replacement_targets(context, &agents, &skill_id, replace)?;
         if replacements.is_empty() {
             if let Some(existing_record) = lock.skills.get(&skill_id).cloned() {
@@ -2465,6 +2502,7 @@ fn add(
                     skill_id,
                     skill,
                     existing_record,
+                    same_upstream: planned.state == add_plan::AddSkillState::Installed,
                 });
                 continue;
             }
@@ -2480,7 +2518,7 @@ fn add(
     let mut prepared_managed = Vec::new();
     for managed in managed_candidates {
         let installed_path = context.store.skill_dir(&managed.skill_id);
-        let diff = skill_source_directory_diff(
+        let mut diff = skill_source_directory_diff(
             &managed.skill_id,
             &installed_path,
             &managed.skill.directory,
@@ -2489,7 +2527,56 @@ fn add(
         let mut locked_agents = managed.existing_record.enabled.clone();
         locked_agents.extend(agent_ids(&agents));
 
-        if !diff.changed && locked_agents == managed.existing_record.enabled {
+        let same_upstream = managed.same_upstream;
+        if !same_upstream {
+            diff.changed = true;
+            let source_change = format!(
+                "upstream source: {} @{} [{}] -> {} @{} [{}]\n",
+                display_source_root(&managed.existing_record),
+                managed
+                    .existing_record
+                    .source
+                    .r#ref
+                    .as_ref()
+                    .map_or("default", GitRef::as_str),
+                source_skill_path(&managed.existing_record),
+                display_user_path(&source.path),
+                source.r#ref.as_ref().map_or("default", GitRef::as_str),
+                managed.skill.skill_path.as_str()
+            );
+            diff.output.insert_str(0, &source_change);
+            if let Some(output) = &mut diff.terminal_output {
+                output.insert_str(0, &source_change);
+            }
+        }
+        let owned_agents = managed
+            .existing_record
+            .enabled
+            .iter()
+            .map(|id| context.registry.get(id.as_str()))
+            .collect::<yasm_core::Result<Vec<_>>>()?;
+        let links_healthy = owned_agents.iter().all(|agent| {
+            let Ok(expected) = context
+                .lifecycle()
+                .skill_link_target(agent, &managed.skill_id)
+            else {
+                return false;
+            };
+            std::fs::read_link(agent.skill_link(&managed.skill_id))
+                .is_ok_and(|target| target == expected.as_std_path())
+        });
+        if !diff.changed
+            && locked_agents == managed.existing_record.enabled
+            && same_upstream
+            && links_healthy
+        {
+            if let Some(record) = lock.skills.get_mut(&managed.skill_id) {
+                record.source = source.clone();
+                record.skill_path = managed.skill.skill_path.clone();
+                record.resolved = fetched.resolved.clone();
+                record.digest = digest_skill_tree(&installed_path)?;
+            }
+            lock.write(&context.paths.lock_file())?;
             unchanged_updates.push(managed.skill_id);
             continue;
         }
@@ -2588,6 +2675,14 @@ fn add(
             context
                 .lifecycle()
                 .enable(&mut lock, &managed.skill_id, &agents, false)?;
+            repair_added_skill_links(context, &mut lock, &managed.skill_id)?;
+            if let Some(record) = lock.skills.get_mut(&managed.skill_id) {
+                record.source = source.clone();
+                record.skill_path = managed.skill.skill_path.clone();
+                record.resolved = fetched.resolved.clone();
+                record.digest = digest_skill_tree(&context.store.skill_dir(&managed.skill_id))?;
+            }
+            lock.write(&context.paths.lock_file())?;
             println!("updated {}", managed.skill_id);
             continue;
         }
@@ -2619,6 +2714,7 @@ fn add(
             if apply_update_action(&prepared.candidate, action, false)? {
                 let skill_id = prepared.candidate.skill_id.clone();
                 apply_update_candidate(context, &mut lock, prepared.candidate, &agents, false)?;
+                repair_added_skill_links(context, &mut lock, &skill_id)?;
                 println!("updated {}", skill_id);
             } else {
                 println!("skipped {}", prepared.candidate.skill_id);
@@ -2679,6 +2775,24 @@ fn add(
         refresh_self_bundle_receipt(context, &mut lock, &fetched, &agents)?;
     }
 
+    Ok(())
+}
+
+fn repair_added_skill_links(
+    context: &ScopeContext,
+    lock: &mut LockFile,
+    skill_id: &SkillId,
+) -> Result<()> {
+    let record = lock
+        .skills
+        .get(skill_id)
+        .context("refreshed skill has no installation receipt")?;
+    let agents = record
+        .enabled
+        .iter()
+        .map(|id| context.registry.get(id.as_str()))
+        .collect::<yasm_core::Result<Vec<_>>>()?;
+    context.lifecycle().enable(lock, skill_id, &agents, false)?;
     Ok(())
 }
 
@@ -4085,6 +4199,7 @@ struct AddManagedCandidate<'a> {
     skill_id: SkillId,
     skill: &'a DiscoveredSkill,
     existing_record: LockedSkillRecord,
+    same_upstream: bool,
 }
 
 struct PreparedManagedAddCandidate<'a> {
@@ -4993,51 +5108,83 @@ fn remove(context: &ScopeContext, skills: &[String], all: bool, json_output: boo
     Ok(())
 }
 
-fn select_skills<'a>(
-    discovered: &'a [DiscoveredSkill],
+fn select_add_skills<'plan, 'skill>(
+    plan: &'plan [add_plan::PlannedSkill<'skill>],
     selection: Option<&str>,
-) -> Result<Vec<&'a DiscoveredSkill>> {
+) -> Result<Vec<&'plan add_plan::PlannedSkill<'skill>>> {
     if let Some(selection) = selection {
-        let matches = discovered
+        let matches = plan
             .iter()
-            .filter(|skill| skill.name.as_str() == selection)
+            .filter(|planned| {
+                planned.skill.name.as_str() == selection
+                    || planned.skill.skill_path.as_str() == selection
+            })
             .collect::<Vec<_>>();
         return match matches.as_slice() {
             [] => anyhow::bail!(
                 "skill `{selection}` was not found; available skills: {}",
-                discovered_skill_names(discovered)
+                if plan.is_empty() {
+                    "none".to_string()
+                } else {
+                    plan.iter()
+                        .map(|planned| planned.skill.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
             ),
             [skill] => Ok(vec![*skill]),
-            _ => {
-                let mut paths = matches
+            _ => anyhow::bail!(
+                "skill `{selection}` is ambiguous; pass --skill <repository-relative SKILL.md path>; matching paths: {}",
+                matches
                     .iter()
-                    .map(|skill| skill.skill_path.as_str())
-                    .collect::<Vec<_>>();
-                paths.sort_unstable();
-                anyhow::bail!(
-                    "skill `{selection}` is ambiguous; matching paths: {}",
-                    paths.join(", ")
-                )
-            }
+                    .map(|planned| planned.skill.skill_path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         };
     }
-    if discovered.is_empty() {
+    if plan.is_empty() {
         anyhow::bail!("no valid skills found in source");
     }
-    if discovered.len() == 1 {
-        return Ok(vec![&discovered[0]]);
-    }
-
-    let labels = discovered
+    let installed = plan
         .iter()
-        .map(display_discovered_skill)
+        .filter(|planned| planned.state == add_plan::AddSkillState::Installed)
         .collect::<Vec<_>>();
-    let defaults = vec![false; labels.len()];
+    if !installed.is_empty() {
+        println!("Already installed from this source:");
+        for planned in &installed {
+            println!("✔ {}", display_discovered_skill(planned.skill));
+        }
+        println!();
+    }
+    let available = plan
+        .iter()
+        .filter(|planned| planned.state != add_plan::AddSkillState::Installed)
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Preserve automatic selection only for a source containing a single skill.
+    // Even one remaining skill in a larger source needs an explicit choice.
+    if plan.len() == 1 {
+        return Ok(vec![available[0]]);
+    }
+    let labels = available
+        .iter()
+        .map(|planned| {
+            let label = display_discovered_skill(planned.skill);
+            if planned.state == add_plan::AddSkillState::Conflict {
+                format!("{label} (different installed source; requires --replace)")
+            } else {
+                label
+            }
+        })
+        .collect::<Vec<_>>();
     let selections = interactive::ask_multiselect(
         "skills",
-        "Select skills to install",
+        "Select additional skills to install",
         &labels,
-        &defaults,
+        &vec![false; labels.len()],
         "pass --skill <name> to choose a skill explicitly",
     )?;
     if selections.is_empty() {
@@ -5045,7 +5192,7 @@ fn select_skills<'a>(
     }
     Ok(selections
         .into_iter()
-        .filter_map(|idx| discovered.get(idx))
+        .filter_map(|index| available.get(index).copied())
         .collect())
 }
 
@@ -5231,18 +5378,6 @@ fn installed_skill_ids(lock: &LockFile) -> String {
         lock.skills
             .keys()
             .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
-fn discovered_skill_names(discovered: &[DiscoveredSkill]) -> String {
-    if discovered.is_empty() {
-        "none".to_string()
-    } else {
-        discovered
-            .iter()
-            .map(|skill| skill.name.to_string())
             .collect::<Vec<_>>()
             .join(", ")
     }

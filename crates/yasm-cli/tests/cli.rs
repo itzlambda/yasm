@@ -1005,11 +1005,13 @@ fn github_tree_url_scopes_add_and_later_updates_to_its_directory() {
     assert!(!yasm_home.path().join("skills/sibling").exists());
     let json = list_json_value(yasm_home.path(), agent_home.path());
     assert_eq!(json["skills"]["selected"]["source"]["ref"], "main");
+    assert!(json["skills"]["selected"]["source"]
+        .get("subpath")
+        .is_none());
     assert_eq!(
-        json["skills"]["selected"]["source"]["subpath"],
-        "skills/selected"
+        json["skills"]["selected"]["skill_path"],
+        "skills/selected/SKILL.md"
     );
-    assert_eq!(json["skills"]["selected"]["skill_path"], "SKILL.md");
     let list = yasm()
         .env("YASM_DATA_DIR", yasm_home.path())
         .env("YASM_CACHE_DIR", yasm_home.path().join("cache"))
@@ -4072,6 +4074,7 @@ fn add_refreshes_existing_managed_skill_and_extends_agents() {
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
         .arg("add")
+        .args(["--skill", "frontend-design", "--replace"])
         .arg("--action")
         .arg("apply")
         .arg(first_source.path())
@@ -4097,6 +4100,7 @@ fn add_refreshes_existing_managed_skill_and_extends_agents() {
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
         .arg("add")
+        .args(["--skill", "frontend-design", "--replace"])
         .arg("--action")
         .arg("apply")
         .arg(second_source.path())
@@ -4139,6 +4143,7 @@ fn add_refreshes_existing_managed_skill_and_extends_agents() {
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
         .arg("add")
+        .args(["--skill", "frontend-design", "--replace"])
         .arg("--action")
         .arg("apply")
         .arg(second_source.path())
@@ -4184,6 +4189,7 @@ fn add_existing_managed_skill_without_action_requires_update_selection() {
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
         .arg("add")
+        .args(["--skill", "frontend-design"])
         .arg("--action")
         .arg("apply")
         .arg(source.path())
@@ -4211,6 +4217,7 @@ fn add_existing_managed_skill_without_action_requires_update_selection() {
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
         .arg("add")
+        .args(["--skill", "frontend-design"])
         .arg(source.path())
         .arg("--agent")
         .arg("universal")
@@ -4244,6 +4251,7 @@ fn add_existing_managed_skill_without_diff_skips_update_selection() {
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
         .arg("add")
+        .args(["--skill", "frontend-design"])
         .arg("--action")
         .arg("apply")
         .arg(source.path())
@@ -4263,6 +4271,7 @@ fn add_existing_managed_skill_without_diff_skips_update_selection() {
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
         .arg("add")
+        .args(["--skill", "frontend-design"])
         .arg(source.path())
         .arg("--agent")
         .arg("universal")
@@ -4292,7 +4301,15 @@ fn add_existing_managed_skill_with_new_agent_still_requires_update_selection() {
         .env("YASM_CACHE_DIR", yasm_home.path().join("cache"))
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
-        .args(["add", "--action", "apply", "--agent", "universal"])
+        .args([
+            "add",
+            "--skill",
+            "frontend-design",
+            "--action",
+            "apply",
+            "--agent",
+            "universal",
+        ])
         .arg(source.path())
         .output()
         .unwrap();
@@ -4303,7 +4320,7 @@ fn add_existing_managed_skill_with_new_agent_still_requires_update_selection() {
         .env("YASM_CACHE_DIR", yasm_home.path().join("cache"))
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
-        .args(["add", "--agent", "claude"])
+        .args(["add", "--skill", "frontend-design", "--agent", "claude"])
         .arg(source.path())
         .output()
         .unwrap();
@@ -4332,6 +4349,7 @@ fn add_existing_managed_skill_without_diff_and_explicit_action_reports_no_change
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
         .arg("add")
+        .args(["--skill", "frontend-design"])
         .arg("--action")
         .arg("apply")
         .arg(source.path())
@@ -4351,6 +4369,7 @@ fn add_existing_managed_skill_without_diff_and_explicit_action_reports_no_change
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
         .arg("add")
+        .args(["--skill", "frontend-design"])
         .arg("--action")
         .arg("apply")
         .arg(source.path())
@@ -4388,6 +4407,7 @@ fn add_existing_lock_record_still_rejects_unmanaged_agent_path_first() {
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
         .arg("add")
+        .args(["--skill", "frontend-design"])
         .arg("--action")
         .arg("apply")
         .arg(source.path())
@@ -4412,6 +4432,7 @@ fn add_existing_lock_record_still_rejects_unmanaged_agent_path_first() {
         .env("YASM_CONFIG_DIR", yasm_home.path().join("config"))
         .env("YASM_AGENT_SKILLS_ROOT", agent_home.path())
         .arg("add")
+        .args(["--skill", "frontend-design"])
         .arg(source.path())
         .arg("--agent")
         .arg("universal")
@@ -7850,4 +7871,590 @@ fn incomplete_migration_journals_preserve_backups_and_store() {
         assert!(backup.join("SKILL.md").exists());
         assert!(project.join(".yasm/skills/demo/SKILL.md").exists());
     }
+}
+
+fn repeated_add_repository() -> TempDir {
+    let remote = tempdir().unwrap();
+    git(remote.path(), &["init", "-b", "main"]);
+    git(
+        remote.path(),
+        &["config", "user.email", "test@example.test"],
+    );
+    git(remote.path(), &["config", "user.name", "Test"]);
+    for name in ["retro", "research"] {
+        write_skill(
+            remote.path(),
+            &format!("skills/{name}"),
+            name,
+            name,
+            "original",
+        );
+    }
+    git(remote.path(), &["add", "."]);
+    git(remote.path(), &["commit", "-m", "initial"]);
+    remote
+}
+
+fn repeated_add_command(data: &Path, agents: &Path, remote: &Path) -> TestCommand {
+    let mut command = yasm_with_roots(data, agents);
+    redirect_github(&mut command, remote);
+    command
+}
+
+fn installation_receipts(data: &Path) -> Value {
+    serde_json::from_slice(&std::fs::read(data.join("yasm.lock")).unwrap()).unwrap()
+}
+
+#[test]
+fn repeated_add_recognizes_equivalent_sources_and_preserves_sibling_receipts() {
+    let data = tempdir().unwrap();
+    let agents = tempdir().unwrap();
+    let remote = repeated_add_repository();
+    let installed = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args([
+            "add",
+            "owner/repo",
+            "--skill",
+            "retro",
+            "--agent",
+            "claude",
+            "--agent",
+            "universal",
+            "--action",
+            "apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let original = installation_receipts(data.path())["skills"]["retro"].clone();
+    write_skill(
+        remote.path(),
+        "skills/retro",
+        "retro",
+        "retro",
+        "upstream changed",
+    );
+    git(remote.path(), &["add", "."]);
+    git(remote.path(), &["commit", "-m", "advance"]);
+
+    let tree = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args([
+            "add",
+            "https://github.com/OWNER/REPO.git/tree/main/skills/retro",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        tree.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tree.stderr)
+    );
+    assert!(String::from_utf8_lossy(&tree.stdout).contains("✔ retro"));
+    assert_eq!(
+        installation_receipts(data.path())["skills"]["retro"],
+        original
+    );
+
+    let missing_selection = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args(["add", "https://github.com/owner/repo/"])
+        .output()
+        .unwrap();
+    assert!(!missing_selection.status.success());
+    assert!(String::from_utf8_lossy(&missing_selection.stdout).contains("✔ retro"));
+    assert!(String::from_utf8_lossy(&missing_selection.stderr).contains("--skill <name>"));
+    assert_eq!(
+        installation_receipts(data.path())["skills"]["retro"],
+        original
+    );
+
+    let added = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args([
+            "add",
+            "owner/repo",
+            "--skill",
+            "research",
+            "--agent",
+            "claude",
+            "--action",
+            "apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert_eq!(
+        installation_receipts(data.path())["skills"]["retro"],
+        original
+    );
+    let before = std::fs::read(data.path().join("yasm.lock")).unwrap();
+    let all = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args(["add", "owner/repo"])
+        .output()
+        .unwrap();
+    assert!(all.status.success());
+    let output = String::from_utf8_lossy(&all.stdout);
+    assert!(output.contains("✔ retro") && output.contains("✔ research"));
+    assert_eq!(
+        std::fs::read(data.path().join("yasm.lock")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read_dir(data.path().join("cache/sources/repositories"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_dir())
+            .count(),
+        1
+    );
+
+    // Removing upstream skills and deleting caches must not remove installations.
+    git(remote.path(), &["rm", "-r", "skills/retro"]);
+    git(remote.path(), &["commit", "-m", "retire retro"]);
+    std::fs::remove_dir_all(data.path().join("cache")).unwrap();
+    let repeated = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args(["add", "owner/repo"])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    assert_eq!(
+        std::fs::read(data.path().join("yasm.lock")).unwrap(),
+        before
+    );
+    assert!(
+        std::fs::read_to_string(data.path().join("skills/retro/SKILL.md"))
+            .unwrap()
+            .contains("original")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn repeated_add_picker_only_offers_additional_skills() {
+    let data = tempdir().unwrap();
+    let agents = tempdir().unwrap();
+    let remote = repeated_add_repository();
+    assert!(
+        repeated_add_command(data.path(), agents.path(), remote.path())
+            .args([
+                "add",
+                "owner/repo",
+                "--skill",
+                "retro",
+                "--no-enable",
+                "--action",
+                "apply"
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let before = installation_receipts(data.path())["skills"]["retro"].clone();
+    let mut command = repeated_add_command(data.path(), agents.path(), remote.path());
+    command.args(["add", "owner/repo", "--no-enable", "--action", "apply"]);
+    let TestCommand { command, _sandbox } = command;
+    let mut session = Session::spawn(command).unwrap();
+    session
+        .expect("Already installed from this source:")
+        .unwrap();
+    session.expect("✔ retro").unwrap();
+    session
+        .expect("Select additional skills to install")
+        .unwrap();
+    session.expect("research").unwrap();
+    session.send(" ").unwrap();
+    session.send_line("").unwrap();
+    session.expect("acquired research").unwrap();
+    session.expect(Eof).unwrap();
+    assert!(matches!(
+        session.get_process().wait().unwrap(),
+        WaitStatus::Exited(_, 0)
+    ));
+    assert_eq!(
+        installation_receipts(data.path())["skills"]["retro"],
+        before
+    );
+    assert!(data.path().join("skills/research/SKILL.md").is_file());
+}
+
+#[test]
+fn different_upstream_requires_replace_even_with_identical_contents() {
+    let data = tempdir().unwrap();
+    let agents = tempdir().unwrap();
+    let first = tempdir().unwrap();
+    let second = tempdir().unwrap();
+    for source in [&first, &second] {
+        write_skill(source.path(), "skills/retro", "retro", "retro", "same");
+    }
+    assert!(yasm_with_roots(data.path(), agents.path())
+        .args(["add", "--no-enable", "--action", "apply"])
+        .arg(first.path())
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let before = std::fs::read(data.path().join("yasm.lock")).unwrap();
+    let conflict = yasm_with_roots(data.path(), agents.path())
+        .args([
+            "add",
+            "--skill",
+            "retro",
+            "--no-enable",
+            "--action",
+            "apply",
+        ])
+        .arg(second.path())
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success());
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("--replace"));
+    assert_eq!(
+        std::fs::read(data.path().join("yasm.lock")).unwrap(),
+        before
+    );
+    let replaced = yasm_with_roots(data.path(), agents.path())
+        .args([
+            "add",
+            "--skill",
+            "retro",
+            "--replace",
+            "--no-enable",
+            "--action",
+            "apply",
+        ])
+        .arg(second.path())
+        .output()
+        .unwrap();
+    assert!(
+        replaced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replaced.stderr)
+    );
+    assert_eq!(
+        installation_receipts(data.path())["skills"]["retro"]["source"]["path"],
+        second.path().canonicalize().unwrap().to_str().unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_add_refreshes_revision_and_repairs_files_and_retained_links() {
+    let data = tempdir().unwrap();
+    let agents = tempdir().unwrap();
+    let remote = repeated_add_repository();
+    for name in ["retro", "research"] {
+        assert!(
+            repeated_add_command(data.path(), agents.path(), remote.path())
+                .args([
+                    "add",
+                    "owner/repo",
+                    "--skill",
+                    name,
+                    "--agent",
+                    "claude",
+                    "--action",
+                    "apply"
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+    let before = installation_receipts(data.path());
+    write_skill(
+        remote.path(),
+        "skills/research",
+        "research",
+        "research",
+        "updated research",
+    );
+    git(remote.path(), &["add", "."]);
+    git(remote.path(), &["commit", "-m", "update sibling"]);
+    let refreshed = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args([
+            "add",
+            "owner/repo",
+            "--skill",
+            "retro",
+            "--no-enable",
+            "--action",
+            "apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(refreshed.status.success());
+    let receipts = installation_receipts(data.path());
+    assert_ne!(
+        receipts["skills"]["retro"]["resolved"],
+        before["skills"]["retro"]["resolved"]
+    );
+    assert_eq!(receipts["skills"]["research"], before["skills"]["research"]);
+    let link = agents.path().join(".claude/skills/retro");
+    std::fs::remove_dir_all(data.path().join("skills/retro")).unwrap();
+    std::fs::remove_file(&link).unwrap();
+    let repaired = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args([
+            "add",
+            "owner/repo",
+            "--skill",
+            "retro",
+            "--no-enable",
+            "--action",
+            "apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    assert!(link.join("SKILL.md").is_file());
+    assert_eq!(
+        installation_receipts(data.path())["skills"]["retro"]["enabled"],
+        serde_json::json!(["claude"])
+    );
+    assert_eq!(
+        installation_receipts(data.path())["skills"]["research"],
+        before["skills"]["research"]
+    );
+    // A manually synchronized copy needs a fresh digest even without a content diff.
+    let previous_digest = installation_receipts(data.path())["skills"]["retro"]["digest"].clone();
+    write_skill(
+        remote.path(),
+        "skills/retro",
+        "retro",
+        "retro",
+        "manually synchronized",
+    );
+    git(remote.path(), &["add", "."]);
+    git(remote.path(), &["commit", "-m", "synchronize retro"]);
+    std::fs::copy(
+        remote.path().join("skills/retro/SKILL.md"),
+        link.join("SKILL.md"),
+    )
+    .unwrap();
+    let synchronized = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args([
+            "add",
+            "owner/repo",
+            "--skill",
+            "retro",
+            "--no-enable",
+            "--action",
+            "apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(synchronized.status.success());
+    assert_ne!(
+        installation_receipts(data.path())["skills"]["retro"]["digest"],
+        previous_digest
+    );
+    assert_eq!(
+        installation_receipts(data.path())["skills"]["research"],
+        before["skills"]["research"]
+    );
+    // Skipping an explicit refresh preserves local modifications and receipts.
+    std::fs::write(link.join("SKILL.md"), "local changes").unwrap();
+    let receipt = std::fs::read(data.path().join("yasm.lock")).unwrap();
+    assert!(
+        repeated_add_command(data.path(), agents.path(), remote.path())
+            .args([
+                "add",
+                "owner/repo",
+                "--skill",
+                "retro",
+                "--no-enable",
+                "--action",
+                "skip"
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read_to_string(link.join("SKILL.md")).unwrap(),
+        "local changes"
+    );
+    assert_eq!(
+        std::fs::read(data.path().join("yasm.lock")).unwrap(),
+        receipt
+    );
+}
+
+#[test]
+fn repository_cache_is_shared_between_project_and_global_installations() {
+    let data = tempdir().unwrap();
+    let agents = tempdir().unwrap();
+    let project = tempdir().unwrap();
+    let remote = repeated_add_repository();
+    assert!(
+        repeated_add_command(data.path(), agents.path(), remote.path())
+            .args([
+                "add",
+                "owner/repo",
+                "--global",
+                "--skill",
+                "retro",
+                "--no-enable",
+                "--action",
+                "apply"
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(yasm_with_roots(data.path(), agents.path())
+        .current_dir(project.path())
+        .args(["init", "--no-migrate"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let original = std::fs::read(data.path().join("yasm.lock")).unwrap();
+    let added = repeated_add_command(data.path(), agents.path(), remote.path())
+        .current_dir(project.path())
+        .args([
+            "add",
+            "owner/repo",
+            "--skill",
+            "retro",
+            "--no-enable",
+            "--action",
+            "apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(project.path().join(".yasm/skills/retro/SKILL.md").is_file());
+    assert_eq!(
+        std::fs::read(data.path().join("yasm.lock")).unwrap(),
+        original
+    );
+    assert_eq!(
+        std::fs::read_dir(data.path().join("cache/sources/repositories"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_dir())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn upstream_identity_distinguishes_refs_and_paths_but_tracks_default_branch_changes() {
+    let data = tempdir().unwrap();
+    let agents = tempdir().unwrap();
+    let remote = repeated_add_repository();
+    assert!(
+        repeated_add_command(data.path(), agents.path(), remote.path())
+            .args([
+                "add",
+                "owner/repo",
+                "--skill",
+                "retro",
+                "--no-enable",
+                "--action",
+                "apply"
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let original = std::fs::read(data.path().join("yasm.lock")).unwrap();
+    git(remote.path(), &["checkout", "-b", "other"]);
+    write_skill(
+        remote.path(),
+        "other/retro",
+        "retro",
+        "retro",
+        "same name, other path",
+    );
+    git(remote.path(), &["add", "."]);
+    git(remote.path(), &["commit", "-m", "other branch"]);
+    let other_ref = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args([
+            "add",
+            "owner/repo@other",
+            "--skill",
+            "retro",
+            "--no-enable",
+            "--action",
+            "apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(!other_ref.status.success());
+    assert!(String::from_utf8_lossy(&other_ref.stderr).contains("ambiguous"));
+    let other_ref_path = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args([
+            "add",
+            "owner/repo@other",
+            "--skill",
+            "skills/retro/SKILL.md",
+            "--no-enable",
+            "--action",
+            "apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(!other_ref_path.status.success());
+    assert!(String::from_utf8_lossy(&other_ref_path.stderr).contains("--replace"));
+    assert_eq!(
+        std::fs::read(data.path().join("yasm.lock")).unwrap(),
+        original
+    );
+    // A source filter isolates the same name at a different path on main.
+    git(remote.path(), &["checkout", "main"]);
+    write_skill(
+        remote.path(),
+        "other/retro",
+        "retro",
+        "retro",
+        "same name, other path",
+    );
+    git(remote.path(), &["add", "."]);
+    git(remote.path(), &["commit", "-m", "duplicate path"]);
+    let other_path = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args([
+            "add",
+            "https://github.com/owner/repo/tree/main/other/retro",
+            "--no-enable",
+            "--action",
+            "apply",
+        ])
+        .output()
+        .unwrap();
+    assert!(!other_path.status.success());
+    assert!(String::from_utf8_lossy(&other_path.stderr).contains("--replace"));
+    assert_eq!(
+        std::fs::read(data.path().join("yasm.lock")).unwrap(),
+        original
+    );
+
+    // Rename the default branch without changing which skill was requested.
+    git(remote.path(), &["branch", "-m", "primary"]);
+    let tracked_default = repeated_add_command(data.path(), agents.path(), remote.path())
+        .args(["add", "owner/repo"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&tracked_default.stdout).contains("✔ retro"));
+    assert_eq!(
+        std::fs::read(data.path().join("yasm.lock")).unwrap(),
+        original
+    );
 }

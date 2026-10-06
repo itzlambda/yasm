@@ -4,6 +4,7 @@ mod source;
 pub mod git;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use sha2::{Digest, Sha256};
 use yasm_core::{Error, ResolvedSource, Result, SourceKind, SourceSpec};
 
 pub use bundled::{self_bundle_digest, self_bundle_skills, BundledSkill, SELF_BUNDLE_ID};
@@ -154,11 +155,7 @@ fn source_root(source: &SourceSpec, repository_root: &Utf8Path) -> Result<Utf8Pa
 }
 
 pub(crate) fn cache_key(source: &SourceSpec) -> String {
-    let mut identity = source.path.clone();
-    if let Some(git_ref) = &source.r#ref {
-        identity.push('@');
-        identity.push_str(git_ref.as_str());
-    }
+    let identity = &source.path;
     let name = source
         .path
         .trim_end_matches(".git")
@@ -166,19 +163,10 @@ pub(crate) fn cache_key(source: &SourceSpec) -> String {
         .next()
         .unwrap_or("source");
     format!(
-        "{:016x}-{}",
-        stable_hash(&identity),
+        "{:x}-{}",
+        Sha256::digest(identity.as_bytes()),
         sanitize_cache_name(name)
     )
-}
-
-fn stable_hash(value: &str) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 fn sanitize_cache_name(value: &str) -> String {
@@ -270,20 +258,30 @@ mod cache_tests {
         let first_commit = git_text(&remote, &["rev-parse", "HEAD"]);
         assert_eq!(first.resolved.as_ref().unwrap().commit, first_commit);
         assert!(first_root.join(".git").exists());
-        std::fs::write(first_root.join("untracked.tmp"), "cache artifact").unwrap();
+        // Keep the first snapshot alive while the remote advances.
 
-        drop(first);
         write_skill(&remote, "new");
         git(&remote, &["add", "."]);
         git(&remote, &["commit", "-m", "new"]);
 
         let second = fetch_source_cached(&source, &cache).unwrap();
-        assert_eq!(second.root, first_root);
+        assert_ne!(second.root, first_root);
         let second_commit = git_text(&remote, &["rev-parse", "HEAD"]);
         let resolved = second.resolved.unwrap();
         assert_eq!(resolved.r#ref.unwrap().as_str(), "main");
         assert_eq!(resolved.commit, second_commit);
-        assert!(!second.root.join("untracked.tmp").exists());
+        assert!(
+            std::fs::read_to_string(first_root.join("skills/example/SKILL.md"))
+                .unwrap()
+                .contains("old")
+        );
+        assert_eq!(
+            std::fs::read_dir(cache.join("repositories"))
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_dir())
+                .count(),
+            1
+        );
         let content = std::fs::read_to_string(second.root.join("skills/example/SKILL.md")).unwrap();
         assert!(content.contains("new"));
     }
@@ -312,7 +310,7 @@ mod cache_tests {
         let first_root = first.root.clone();
         let first_commit = git_text(&remote, &["rev-parse", "HEAD"]);
         let first_resolved = first.resolved.as_ref().unwrap();
-        assert_eq!(first_resolved.r#ref, None);
+        assert_eq!(first_resolved.r#ref.as_ref().unwrap().as_str(), "develop");
         assert_eq!(first_resolved.commit, first_commit);
         assert_eq!(
             git_text(&first_root, &["symbolic-ref", "refs/remotes/origin/HEAD"]),
@@ -325,17 +323,55 @@ mod cache_tests {
         git(&remote, &["commit", "-m", "new"]);
 
         let second = fetch_source_cached(&source, &cache).unwrap();
-        assert_eq!(second.root, first_root);
+        assert_ne!(second.root, first_root);
         let second_commit = git_text(&remote, &["rev-parse", "HEAD"]);
         let second_resolved = second.resolved.unwrap();
-        assert_eq!(second_resolved.r#ref, None);
+        assert_eq!(second_resolved.r#ref.as_ref().unwrap().as_str(), "develop");
         assert_eq!(second_resolved.commit, second_commit);
         let content = std::fs::read_to_string(second.root.join("skills/example/SKILL.md")).unwrap();
         assert!(content.contains("new"));
+
+        // Following the default branch must survive upstream changing HEAD.
+        git(&remote, &["checkout", "-b", "primary"]);
+        write_skill(&remote, "new default");
+        git(&remote, &["add", "."]);
+        git(&remote, &["commit", "-m", "change default"]);
+        let third = fetch_source_cached(&source, &cache).unwrap();
+        assert_eq!(
+            third
+                .resolved
+                .as_ref()
+                .unwrap()
+                .r#ref
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "primary"
+        );
+        assert!(
+            std::fs::read_to_string(third.root.join("skills/example/SKILL.md"))
+                .unwrap()
+                .contains("new default")
+        );
+        assert!(
+            std::fs::read_to_string(first_root.join("skills/example/SKILL.md"))
+                .unwrap()
+                .contains("old")
+        );
+        let unavailable = SourceSpec {
+            r#ref: Some(GitRef::parse("missing-branch").unwrap()),
+            ..source.clone()
+        };
+        assert!(fetch_source_cached(&unavailable, &cache).is_err());
+        // Failed acquisition releases its lock and preserves existing snapshots.
+        assert_eq!(
+            fetch_source_cached(&source, &cache).unwrap().root,
+            third.root
+        );
     }
 
     #[test]
-    fn checkout_lease_prevents_updates_until_all_readers_release_it() {
+    fn snapshots_can_be_read_while_other_refs_are_fetched() {
         let remote_temp = tempdir().unwrap();
         let remote = Utf8PathBuf::from_path_buf(remote_temp.path().to_path_buf()).unwrap();
         git(&remote, &["init", "-b", "main"]);
@@ -353,15 +389,35 @@ mod cache_tests {
             subpath: None,
         };
         let first = fetch_source_cached(&source, &cache).unwrap();
-        let reader = first.clone();
-        assert!(fetch_source_cached(&source, &cache)
-            .unwrap_err()
-            .to_string()
-            .contains("cannot lock Git checkout"));
-        drop(first);
-        assert!(fetch_source_cached(&source, &cache).is_err());
-        drop(reader);
-        fetch_source_cached(&source, &cache).unwrap();
+        let same = fetch_source_cached(&source, &cache).unwrap();
+        assert_eq!(same.root, first.root);
+        git(&remote, &["checkout", "-b", "other"]);
+        write_skill(&remote, "other branch");
+        git(&remote, &["add", "."]);
+        git(&remote, &["commit", "-m", "other"]);
+        let other = SourceSpec {
+            r#ref: Some(GitRef::parse("other").unwrap()),
+            ..source.clone()
+        };
+        let second = fetch_source_cached(&other, &cache).unwrap();
+        assert_ne!(first.root, second.root);
+        assert!(
+            std::fs::read_to_string(first.root.join("skills/example/SKILL.md"))
+                .unwrap()
+                .contains("old")
+        );
+        assert!(
+            std::fs::read_to_string(second.root.join("skills/example/SKILL.md"))
+                .unwrap()
+                .contains("other branch")
+        );
+        assert_eq!(
+            std::fs::read_dir(cache.join("repositories"))
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_dir())
+                .count(),
+            1
+        );
     }
 
     #[test]
