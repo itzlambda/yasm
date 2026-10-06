@@ -269,7 +269,11 @@ fn split_ref(input: &str) -> Result<(&str, Option<GitRef>)> {
 }
 
 fn github_clone_url(owner: &str, repository: &str) -> String {
-    format!("https://github.com/{owner}/{repository}.git")
+    format!(
+        "https://github.com/{}/{}.git",
+        owner.to_ascii_lowercase(),
+        repository.to_ascii_lowercase()
+    )
 }
 
 #[cfg(test)]
