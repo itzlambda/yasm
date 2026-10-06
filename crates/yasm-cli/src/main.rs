@@ -2495,14 +2495,25 @@ fn add(
     for planned in selected {
         let skill = planned.skill;
         let skill_id = planned.skill_id.clone();
-        let replacements = add_replacement_targets(context, &agents, &skill_id, replace)?;
+        let existing_record = lock.skills.get(&skill_id).cloned();
+        let mut candidate_agents = agents.clone();
+        if let Some(record) = &existing_record {
+            for id in &record.enabled {
+                if !candidate_agents.iter().any(|agent| &agent.id == id) {
+                    candidate_agents.push(context.registry.get(id.as_str())?);
+                }
+            }
+        }
+        // Retained links must be checked before either files or receipts change.
+        let replacements = add_replacement_targets(context, &candidate_agents, &skill_id, replace)?;
         if replacements.is_empty() {
-            if let Some(existing_record) = lock.skills.get(&skill_id).cloned() {
+            if let Some(existing_record) = existing_record {
                 managed_candidates.push(AddManagedCandidate {
                     skill_id,
                     skill,
                     existing_record,
                     same_upstream: planned.state == add_plan::AddSkillState::Installed,
+                    agents: candidate_agents,
                 });
                 continue;
             }
@@ -2511,6 +2522,7 @@ fn add(
             skill_id,
             skill,
             replacements,
+            agents: candidate_agents,
         });
     }
 
@@ -2525,7 +2537,7 @@ fn add(
             source.kind.is_git(),
         )?;
         let mut locked_agents = managed.existing_record.enabled.clone();
-        locked_agents.extend(agent_ids(&agents));
+        locked_agents.extend(agent_ids(&managed.agents));
 
         let same_upstream = managed.same_upstream;
         if !same_upstream {
@@ -2674,8 +2686,7 @@ fn add(
         if !prepared.diff.changed {
             context
                 .lifecycle()
-                .enable(&mut lock, &managed.skill_id, &agents, false)?;
-            repair_added_skill_links(context, &mut lock, &managed.skill_id)?;
+                .enable(&mut lock, &managed.skill_id, &managed.agents, false)?;
             if let Some(record) = lock.skills.get_mut(&managed.skill_id) {
                 record.source = source.clone();
                 record.skill_path = managed.skill.skill_path.clone();
@@ -2702,6 +2713,7 @@ fn add(
                 selected_skill: (*managed.skill).clone(),
                 diff: prepared.diff,
             },
+            agents: managed.agents,
         });
     }
 
@@ -2713,8 +2725,13 @@ fn add(
         for prepared in changed_updates {
             if apply_update_action(&prepared.candidate, action, false)? {
                 let skill_id = prepared.candidate.skill_id.clone();
-                apply_update_candidate(context, &mut lock, prepared.candidate, &agents, false)?;
-                repair_added_skill_links(context, &mut lock, &skill_id)?;
+                apply_update_candidate(
+                    context,
+                    &mut lock,
+                    prepared.candidate,
+                    &prepared.agents,
+                    false,
+                )?;
                 println!("updated {}", skill_id);
             } else {
                 println!("skipped {}", prepared.candidate.skill_id);
@@ -2725,7 +2742,7 @@ fn add(
     if !install_candidates.is_empty() {
         let action = match effective_action {
             Some(action) => action,
-            None => select_add_action(&agents, &install_candidates)?,
+            None => select_add_action(&install_candidates)?,
         };
         for candidate in install_candidates {
             if action == ChangeAction::Skip {
@@ -2760,7 +2777,7 @@ fn add(
                 continue;
             }
 
-            apply_install_candidate(context, &mut lock, &source, &fetched, candidate, &agents)?;
+            apply_install_candidate(context, &mut lock, &source, &fetched, candidate)?;
         }
     }
 
@@ -2775,24 +2792,6 @@ fn add(
         refresh_self_bundle_receipt(context, &mut lock, &fetched, &agents)?;
     }
 
-    Ok(())
-}
-
-fn repair_added_skill_links(
-    context: &ScopeContext,
-    lock: &mut LockFile,
-    skill_id: &SkillId,
-) -> Result<()> {
-    let record = lock
-        .skills
-        .get(skill_id)
-        .context("refreshed skill has no installation receipt")?;
-    let agents = record
-        .enabled
-        .iter()
-        .map(|id| context.registry.get(id.as_str()))
-        .collect::<yasm_core::Result<Vec<_>>>()?;
-    context.lifecycle().enable(lock, skill_id, &agents, false)?;
     Ok(())
 }
 
@@ -2905,8 +2904,8 @@ fn apply_install_candidate(
     source: &SourceSpec,
     fetched: &FetchedSource,
     candidate: AddInstallCandidate<'_>,
-    agents: &[&Agent],
 ) -> Result<()> {
+    let agents = &candidate.agents;
     let skill_id = candidate.skill_id;
     let install_progress = progress::Progress::start(format!("Acquiring {skill_id} ..."), false);
     let lifecycle = context.lifecycle();
@@ -4200,6 +4199,7 @@ struct AddManagedCandidate<'a> {
     skill: &'a DiscoveredSkill,
     existing_record: LockedSkillRecord,
     same_upstream: bool,
+    agents: Vec<&'a Agent>,
 }
 
 struct PreparedManagedAddCandidate<'a> {
@@ -4211,10 +4211,12 @@ struct AddInstallCandidate<'a> {
     skill_id: SkillId,
     skill: &'a DiscoveredSkill,
     replacements: BTreeSet<Utf8PathBuf>,
+    agents: Vec<&'a Agent>,
 }
 
-struct PreparedAddUpdate {
+struct PreparedAddUpdate<'a> {
     candidate: UpdateCandidate,
+    agents: Vec<&'a Agent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -4323,10 +4325,7 @@ fn add_replacement_targets(
     Ok(replacements)
 }
 
-fn select_add_action(
-    agents: &[&Agent],
-    candidates: &[AddInstallCandidate<'_>],
-) -> Result<ChangeAction> {
+fn select_add_action(candidates: &[AddInstallCandidate<'_>]) -> Result<ChangeAction> {
     let has_replacements = candidates
         .iter()
         .any(|candidate| !candidate.replacements.is_empty());
@@ -4347,7 +4346,11 @@ fn select_add_action(
         if !candidate.replacements.is_empty() {
             print_existing_skill_message(
                 &candidate.skill_id,
-                &replacement_agent_ids(agents, &candidate.skill_id, &candidate.replacements)?,
+                &replacement_agent_ids(
+                    &candidate.agents,
+                    &candidate.skill_id,
+                    &candidate.replacements,
+                )?,
             );
         }
     }
@@ -4627,7 +4630,11 @@ fn skill_source_directory_diff_with_labels(
         let installed_path = installed.join(&path);
         let candidate_path = candidate.join(&path);
         let installed_entry = diff_entry(&installed_path)?;
-        let candidate_entry = diff_entry(&candidate_path)?;
+        let candidate_entry = if candidate_files.contains(&path) {
+            diff_entry(&candidate_path)?
+        } else {
+            DiffEntry::Missing
+        };
         if installed_entry == candidate_entry {
             continue;
         }

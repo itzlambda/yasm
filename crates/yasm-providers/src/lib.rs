@@ -234,6 +234,70 @@ mod cache_tests {
     }
 
     #[test]
+    fn cached_remote_fetch_omits_history_and_prunes_interrupted_snapshots() {
+        let remote_temp = tempdir().unwrap();
+        let remote = Utf8Path::from_path(remote_temp.path()).unwrap();
+        git(remote, &["init", "-b", "main"]);
+        git(remote, &["config", "user.email", "test@example.com"]);
+        git(remote, &["config", "user.name", "Test"]);
+        write_skill(remote, "current");
+        std::fs::write(remote.join("obsolete.bin"), vec![42; 1024 * 1024]).unwrap();
+        git(remote, &["add", "."]);
+        git(remote, &["commit", "-m", "historical asset"]);
+        let old_blob = git_text(remote, &["rev-parse", "HEAD:obsolete.bin"]);
+        git(remote, &["rm", "obsolete.bin"]);
+        git(remote, &["commit", "-m", "remove historical asset"]);
+        let source = SourceSpec {
+            kind: SourceKind::Github,
+            // file transport exercises shallow transfer; a plain local clone ignores depth.
+            path: format!("file://{remote}"),
+            r#ref: Some(GitRef::parse("main").unwrap()),
+            subpath: None,
+        };
+        let cache_temp = tempdir().unwrap();
+        let cache = Utf8Path::from_path(cache_temp.path()).unwrap();
+        let first = fetch_source_cached(&source, cache).unwrap();
+        let repository = cache.join("repositories").join(cache_key(&source));
+        assert_eq!(git_text(&repository, &["rev-list", "--count", "HEAD"]), "1");
+        assert!(!std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["cat-file", "-e", &old_blob])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        // Simulate a process interrupted before publishing a staged worktree.
+        let abandoned = cache.join("abandoned");
+        git(
+            &repository,
+            &["worktree", "add", "--detach", abandoned.as_str(), "HEAD"],
+        );
+        std::fs::remove_dir_all(&abandoned).unwrap();
+        git(
+            &repository,
+            &["config", "worktree.useRelativePaths", "true"],
+        );
+        let second = fetch_source_cached(&source, cache).unwrap();
+        assert_eq!(first.root, second.root);
+        write_skill(remote, "updated");
+        git(remote, &["add", "."]);
+        git(remote, &["commit", "-m", "advance shallow source"]);
+        let updated = fetch_source_cached(&source, cache).unwrap();
+        assert_ne!(first.root, updated.root);
+        assert_eq!(
+            fetch_source_cached(&source, cache).unwrap().root,
+            updated.root
+        );
+        assert!(!git_text(&repository, &["worktree", "list", "--porcelain"])
+            .contains(abandoned.as_str()));
+        assert_eq!(
+            git_text(&first.root, &["rev-parse", "HEAD"]),
+            first.resolved.unwrap().commit
+        );
+    }
+
+    #[test]
     fn cached_git_fetch_reuses_clone_and_pulls_updates() {
         let remote_temp = tempdir().unwrap();
         let remote = Utf8PathBuf::from_path_buf(remote_temp.path().to_path_buf()).unwrap();

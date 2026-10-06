@@ -92,6 +92,39 @@ fn managed_checkout_exists(destination: &Utf8Path) -> Result<bool> {
     }
 }
 
+fn managed_snapshot_exists(destination: &Utf8Path, repository: &Utf8Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(yasm_core::error::io(destination, error)),
+    };
+    let git_file = destination.join(".git");
+    let valid = metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && std::fs::symlink_metadata(&git_file)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        && std::fs::read_to_string(&git_file)
+            .ok()
+            .is_some_and(|contents| {
+                let Some(path) = contents.trim().strip_prefix("gitdir: ") else {
+                    return false;
+                };
+                let Ok(admin) = std::fs::canonicalize(path) else {
+                    return false;
+                };
+                admin.starts_with(repository.join(".git/worktrees"))
+                    && std::fs::read_to_string(admin.join("gitdir"))
+                        .is_ok_and(|backlink| backlink.trim() == git_file.as_str())
+            });
+    if valid {
+        Ok(true)
+    } else {
+        Err(Error::Message(format!(
+            "source cache exists but is not a managed Git snapshot: {destination}"
+        )))
+    }
+}
+
 /// A repository address validated independently of skill or catalog inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitRemote {
@@ -242,6 +275,12 @@ fn cached_snapshot(
     pin: Option<&str>,
     cache_dir: &Utf8Path,
 ) -> Result<FetchedCheckout> {
+    std::fs::create_dir_all(cache_dir).map_err(|error| yasm_core::error::io(cache_dir, error))?;
+    // Git resolves worktree paths relative to the repository, not the caller.
+    let cache_dir =
+        std::fs::canonicalize(cache_dir).map_err(|error| yasm_core::error::io(cache_dir, error))?;
+    let cache_dir = Utf8PathBuf::from_path_buf(cache_dir)
+        .map_err(|path| Error::NonUtf8Path(path.display().to_string()))?;
     let repositories = cache_dir.join("repositories");
     std::fs::create_dir_all(&repositories)
         .map_err(|error| yasm_core::error::io(&repositories, error))?;
@@ -251,7 +290,7 @@ fn cached_snapshot(
     if !managed_checkout_exists(&repository)? {
         let mut clone = git_command();
         clone
-            .args(["clone", "--no-checkout", "--", &source.path])
+            .args(["clone", "--depth", "1", "--no-checkout", "--", &source.path])
             .arg(&repository);
         if let Err(error) = run_git(clone, source, "git clone") {
             let _ = std::fs::remove_dir_all(&repository);
@@ -271,7 +310,7 @@ fn cached_snapshot(
     fetch
         .arg("-C")
         .arg(&repository)
-        .args(["fetch", "origin", target]);
+        .args(["fetch", "--depth", "1", "origin", target]);
     run_git(fetch, source, "git fetch")?;
     let mut resolve = git_command();
     resolve
@@ -284,7 +323,13 @@ fn cached_snapshot(
     let snapshots = cache_dir.join("snapshots").join(&key);
     std::fs::create_dir_all(&snapshots).map_err(|error| yasm_core::error::io(&snapshots, error))?;
     let destination = snapshots.join(&commit);
-    if !managed_checkout_exists(&destination)? {
+    let mut prune = git_command();
+    prune
+        .arg("-C")
+        .arg(&repository)
+        .args(["worktree", "prune", "--expire", "now"]);
+    run_git(prune, source, "clean interrupted Git snapshots")?;
+    if !managed_snapshot_exists(&destination, &repository)? {
         // Stage completely before publishing. An interrupted command cannot leave
         // a half-materialized snapshot that a later reader would accept.
         let staging = tempfile::Builder::new()
@@ -294,20 +339,33 @@ fn cached_snapshot(
         let staging_root = Utf8PathBuf::from_path_buf(staging.path().to_path_buf())
             .map_err(|path| Error::NonUtf8Path(path.display().to_string()))?;
         let checkout = staging_root.join("checkout");
-        let mut clone = git_command();
-        clone
-            .args(["clone", "--shared", "--no-checkout", "--"])
-            .arg(&repository)
-            .arg(&checkout);
-        run_git(clone, source, "materialize Git snapshot")?;
-        let mut detach = git_command();
-        detach
-            .arg("-C")
-            .arg(&checkout)
-            .args(["checkout", "--detach", &commit]);
-        run_git(detach, source, "check out Git snapshot")?;
-        std::fs::rename(&checkout, &destination)
-            .map_err(|error| yasm_core::error::io(&destination, error))?;
+        let publish = (|| {
+            let mut add = git_command();
+            add.arg("-C")
+                .arg(&repository)
+                .args(["worktree", "add", "--detach", "--"])
+                .arg(&checkout)
+                .arg(&commit);
+            run_git(add, source, "materialize Git snapshot")?;
+            let mut move_snapshot = git_command();
+            move_snapshot
+                .arg("-C")
+                .arg(&repository)
+                .args(["worktree", "move", "--"])
+                .arg(&checkout)
+                .arg(&destination);
+            run_git(move_snapshot, source, "publish Git snapshot")
+        })();
+        if let Err(error) = publish {
+            let mut cleanup = git_command();
+            cleanup
+                .arg("-C")
+                .arg(&repository)
+                .args(["worktree", "remove", "--force", "--"])
+                .arg(&checkout);
+            let _ = run_git(cleanup, source, "clean failed Git snapshot");
+            return Err(error);
+        }
     }
     Ok(FetchedCheckout {
         root: destination,
@@ -358,6 +416,8 @@ fn git_command() -> Command {
         .arg("credential.helper=")
         .arg("-c")
         .arg("gc.auto=0")
+        .arg("-c")
+        .arg("worktree.useRelativePaths=false")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never");
     command

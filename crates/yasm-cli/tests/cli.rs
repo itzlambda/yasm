@@ -5763,8 +5763,9 @@ fn root_level_github_skill_ignores_checkout_metadata_when_updating() {
         .unwrap();
     assert!(
         verified.status.success(),
-        "update failed: {}",
-        String::from_utf8_lossy(&verified.stderr)
+        "update failed: {} {}",
+        String::from_utf8_lossy(&verified.stderr),
+        String::from_utf8_lossy(&verified.stdout)
     );
     let summary: Value = serde_json::from_slice(&verified.stdout).unwrap();
     assert_eq!(summary["updated"], serde_json::json!([]));
@@ -8456,5 +8457,142 @@ fn upstream_identity_distinguishes_refs_and_paths_but_tracks_default_branch_chan
     assert_eq!(
         std::fs::read(data.path().join("yasm.lock")).unwrap(),
         original
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_add_preflights_retained_agent_conflicts_before_changing_installation() {
+    for foreign_symlink in [false, true] {
+        let data = tempdir().unwrap();
+        let agents = tempdir().unwrap();
+        let remote = repeated_add_repository();
+        assert!(
+            repeated_add_command(data.path(), agents.path(), remote.path())
+                .args([
+                    "add",
+                    "owner/repo",
+                    "--skill",
+                    "retro",
+                    "--agent",
+                    "claude",
+                    "--action",
+                    "apply"
+                ])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let link = agents.path().join(".claude/skills/retro");
+        std::fs::remove_file(&link).unwrap();
+        if foreign_symlink {
+            let foreign = agents.path().join("foreign");
+            std::fs::create_dir(&foreign).unwrap();
+            std::os::unix::fs::symlink(&foreign, &link).unwrap();
+        } else {
+            std::fs::create_dir(&link).unwrap();
+            std::fs::write(link.join("local.txt"), "preserve this directory").unwrap();
+        }
+        write_skill(
+            remote.path(),
+            "skills/retro",
+            "retro",
+            "retro",
+            "new upstream contents",
+        );
+        git(remote.path(), &["add", "."]);
+        git(remote.path(), &["commit", "-m", "change retro"]);
+        let before = std::fs::read(data.path().join("yasm.lock")).unwrap();
+        let contents = std::fs::read(data.path().join("skills/retro/SKILL.md")).unwrap();
+        let failed = repeated_add_command(data.path(), agents.path(), remote.path())
+            .args([
+                "add",
+                "owner/repo",
+                "--skill",
+                "retro",
+                "--no-enable",
+                "--action",
+                "apply",
+            ])
+            .output()
+            .unwrap();
+        assert!(!failed.status.success());
+        assert_eq!(
+            std::fs::read(data.path().join("yasm.lock")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read(data.path().join("skills/retro/SKILL.md")).unwrap(),
+            contents
+        );
+        if !foreign_symlink {
+            assert!(String::from_utf8_lossy(&failed.stderr).contains("--replace"));
+            let replaced = repeated_add_command(data.path(), agents.path(), remote.path())
+                .args([
+                    "add",
+                    "owner/repo",
+                    "--skill",
+                    "retro",
+                    "--no-enable",
+                    "--replace",
+                    "--action",
+                    "apply",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                replaced.status.success(),
+                "{}",
+                String::from_utf8_lossy(&replaced.stderr)
+            );
+            assert!(std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(std::fs::read_to_string(link.join("SKILL.md"))
+                .unwrap()
+                .contains("new upstream contents"));
+            assert_eq!(
+                installation_receipts(data.path())["skills"]["retro"]["enabled"],
+                serde_json::json!(["claude"])
+            );
+        }
+    }
+}
+
+#[test]
+fn repeated_add_supports_relative_cache_directories() {
+    let remote = repeated_add_repository();
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let agents = tempfile::tempdir().unwrap();
+    for _ in 0..2 {
+        let output = repeated_add_command(data.path(), agents.path(), remote.path())
+            .current_dir(workspace.path())
+            .env("YASM_CACHE_DIR", "relative-cache")
+            .args([
+                "add",
+                "owner/repo",
+                "--skill",
+                "retro",
+                "--no-enable",
+                "--action",
+                "apply",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(workspace.path().join("relative-cache/sources/repositories"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_type().unwrap().is_dir())
+            .count(),
+        1
     );
 }
