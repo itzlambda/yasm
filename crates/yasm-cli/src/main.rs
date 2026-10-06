@@ -1,4 +1,5 @@
 mod add_plan;
+mod agent_files;
 mod binary_update;
 mod bundle;
 mod terminal_diff;
@@ -105,10 +106,16 @@ enum Command {
         )]
         no_migrate: bool,
     },
-    #[command(about = "Adopt existing agent skills into the selected Yasm store")]
+    #[command(about = "Adopt existing skills or agent files into the selected Yasm store")]
     Migrate {
         #[command(flatten)]
         scope: ScopeArgs,
+        #[arg(
+            long,
+            conflicts_with_all = ["skill", "with_upstream", "source"],
+            help = "Adopt AGENTS.md and CLAUDE.md instead of skills"
+        )]
+        agent_files: bool,
         #[arg(long, help = "Adopt only this discovered skill; may be repeated")]
         skill: Vec<String>,
         #[arg(
@@ -366,6 +373,7 @@ fn main() -> Result<()> {
         } => init(action, &skill, with_upstream, source.as_deref(), no_migrate),
         Command::Migrate {
             scope,
+            agent_files,
             skill,
             with_upstream,
             source,
@@ -373,7 +381,12 @@ fn main() -> Result<()> {
         } => {
             let context = ScopeContext::resolve(scope)?;
             print_init_tip_if_relevant(&context, scope.global, false)?;
-            migrate(&context, &skill, with_upstream, source.as_deref(), action)
+            if agent_files {
+                agent_files::migrate(&context, action)
+            } else {
+                agent_files::require_no_pending(&context)?;
+                migrate(&context, &skill, with_upstream, source.as_deref(), action)
+            }
         }
         Command::Add {
             scope,
@@ -573,6 +586,7 @@ impl ScopeContext {
     }
 
     fn require_no_pending_migration(&self) -> Result<()> {
+        agent_files::require_no_pending(self)?;
         let journal = migration_journal_path(self);
         if std::fs::symlink_metadata(&journal).is_ok() {
             anyhow::bail!(
