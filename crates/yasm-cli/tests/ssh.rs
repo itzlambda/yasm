@@ -467,7 +467,7 @@ fn scp_git_operations_respect_repository_configuration_context() {
     assert!(std::fs::read_to_string(sandbox.root.path().join("ssh.log"))
         .unwrap()
         .contains("conditional key"));
-    let checkout = std::fs::read_dir(sandbox.root.path().join("cache/sources"))
+    let checkout = std::fs::read_dir(sandbox.root.path().join("cache/sources/repositories"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| path.join(".git").is_dir())

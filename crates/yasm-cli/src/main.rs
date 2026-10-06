@@ -1,5 +1,7 @@
+mod add_plan;
 mod agent_files;
 mod binary_update;
+mod bundle;
 mod terminal_diff;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,6 +35,8 @@ use yasm_providers::{
 
 mod interactive;
 mod progress;
+
+use self::bundle::{bundle_member_enabled, SelfBundle};
 
 const DEFAULT_PAGER_COMMAND: &str = "less -R";
 const DEFAULT_LESS_ENV: &str = "R";
@@ -143,7 +147,7 @@ enum Command {
         source: SourceInput,
         #[arg(
             long,
-            help = "Skill name to acquire when the source contains multiple skills"
+            help = "Skill name or repository-relative SKILL.md path to install, refresh, or repair"
         )]
         skill: Option<String>,
         #[arg(
@@ -162,7 +166,7 @@ enum Command {
         action: Option<ChangeAction>,
         #[arg(
             long,
-            help = "Replace existing unmanaged agent skill directories with managed links"
+            help = "Replace a different upstream source or unmanaged agent skill directories"
         )]
         replace: bool,
     },
@@ -2406,21 +2410,21 @@ fn add(
     requested_action: Option<ChangeAction>,
     replace: bool,
 ) -> Result<()> {
-    let source = source_input.into_spec()?;
+    let mut source = source_input.into_spec()?;
     let bundled = source.kind == SourceKind::Bundled;
     if bundled && skill_selection.is_some() {
         anyhow::bail!(
             "the `self` bundle is installed as a unit; remove `--skill` and run `yasm add self`"
         );
     }
-    let temp = tempdir()?;
+    let mut lock = LockFile::read(&context.paths.lock_file())?;
     let progress = progress::Progress::start("Fetching source ...", false);
-    let fetched = fetch_source(&source, &utf8_temp_path(&temp)?)?;
+    let fetched = fetch_source_cached(&source, &context.paths.cache_dir.join("sources"))?;
     progress.set_message("Discovering skills ...");
     let discovery = discover_skills_with_diagnostics(&fetched.root)?;
     warn_skipped_skills(&progress, &discovery.skipped);
     progress.finish_and_clear();
-    let discovered = discovery.skills;
+    let mut discovered = discovery.skills;
     if discovered.is_empty() {
         if let Some(subpath) = &source.subpath {
             anyhow::bail!(
@@ -2429,17 +2433,52 @@ fn add(
             );
         }
     }
-    if bundled {
-        validate_self_bundle_manifest(&discovered)?;
+    // Receipts use repository-relative paths, regardless of the discovery filter.
+    for skill in &mut discovered {
+        skill.skill_path = add_plan::repository_skill_path(&source, &skill.skill_path)?;
     }
-    let skills = if bundled {
-        discovered.iter().collect()
+    source.subpath = None;
+    let bundle = bundled
+        .then(|| SelfBundle::from_skills(&discovered))
+        .transpose()?;
+    let plan = add_plan::plan_skills(&discovered, &source, fetched.resolved.as_ref(), &lock)?;
+    let selected = if bundled {
+        plan.iter().collect::<Vec<_>>()
     } else {
-        select_skills(&discovered, skill_selection)?
+        select_add_skills(&plan, skill_selection)?
     };
+    let skills = selected
+        .iter()
+        .map(|planned| planned.skill)
+        .collect::<Vec<_>>();
+    if skills.is_empty() {
+        return Ok(());
+    }
     validate_reserved_skill_ids(&skills, bundled)?;
+    let mut selected_ids = BTreeMap::new();
+    for planned in &selected {
+        if let Some(previous) =
+            selected_ids.insert(&planned.skill_id, planned.skill.skill_path.as_str())
+        {
+            anyhow::bail!("selected skills share installation ID `{}`; conflicting paths: {previous}, {}; choose one with --skill <name-or-path>",
+                planned.skill_id, planned.skill.skill_path.as_str());
+        }
+    }
+    if requested_action != Some(ChangeAction::Skip) {
+        for planned in &selected {
+            if planned.state == add_plan::AddSkillState::Conflict && !replace && !bundled {
+                let existing = lock
+                    .skills
+                    .get(&planned.skill_id)
+                    .context("planned source conflict has no installation receipt")?;
+                anyhow::bail!(
+                    "skill `{}` is already acquired from {} at `{}`; pass --replace to replace its upstream source",
+                    planned.skill_id, display_source_root(existing), existing.skill_path.as_str()
+                );
+            }
+        }
+    }
     let agents = select_add_agents(&context.registry, agent_filter, no_enable)?;
-    let mut lock = LockFile::read(&context.paths.lock_file())?;
 
     if bundled {
         for skill in &skills {
@@ -2470,15 +2509,28 @@ fn add(
 
     let mut managed_candidates = Vec::new();
     let mut install_candidates = Vec::new();
-    for skill in skills {
-        let skill_id = sanitize_skill_id(&skill.name)?;
-        let replacements = add_replacement_targets(context, &agents, &skill_id, replace)?;
+    for planned in selected {
+        let skill = planned.skill;
+        let skill_id = planned.skill_id.clone();
+        let existing_record = lock.skills.get(&skill_id).cloned();
+        let mut candidate_agents = agents.clone();
+        if let Some(record) = &existing_record {
+            for id in &record.enabled {
+                if !candidate_agents.iter().any(|agent| &agent.id == id) {
+                    candidate_agents.push(context.registry.get(id.as_str())?);
+                }
+            }
+        }
+        // Retained links must be checked before either files or receipts change.
+        let replacements = add_replacement_targets(context, &candidate_agents, &skill_id, replace)?;
         if replacements.is_empty() {
-            if let Some(existing_record) = lock.skills.get(&skill_id).cloned() {
+            if let Some(existing_record) = existing_record {
                 managed_candidates.push(AddManagedCandidate {
                     skill_id,
                     skill,
                     existing_record,
+                    same_upstream: planned.state == add_plan::AddSkillState::Installed,
+                    agents: candidate_agents,
                 });
                 continue;
             }
@@ -2487,6 +2539,7 @@ fn add(
             skill_id,
             skill,
             replacements,
+            agents: candidate_agents,
         });
     }
 
@@ -2494,16 +2547,65 @@ fn add(
     let mut prepared_managed = Vec::new();
     for managed in managed_candidates {
         let installed_path = context.store.skill_dir(&managed.skill_id);
-        let diff = skill_source_directory_diff(
+        let mut diff = skill_source_directory_diff(
             &managed.skill_id,
             &installed_path,
             &managed.skill.directory,
             source.kind.is_git(),
         )?;
         let mut locked_agents = managed.existing_record.enabled.clone();
-        locked_agents.extend(agent_ids(&agents));
+        locked_agents.extend(agent_ids(&managed.agents));
 
-        if !diff.changed && locked_agents == managed.existing_record.enabled {
+        let same_upstream = managed.same_upstream;
+        if !same_upstream {
+            diff.changed = true;
+            let source_change = format!(
+                "upstream source: {} @{} [{}] -> {} @{} [{}]\n",
+                display_source_root(&managed.existing_record),
+                managed
+                    .existing_record
+                    .source
+                    .r#ref
+                    .as_ref()
+                    .map_or("default", GitRef::as_str),
+                source_skill_path(&managed.existing_record),
+                display_user_path(&source.path),
+                source.r#ref.as_ref().map_or("default", GitRef::as_str),
+                managed.skill.skill_path.as_str()
+            );
+            diff.output.insert_str(0, &source_change);
+            if let Some(output) = &mut diff.terminal_output {
+                output.insert_str(0, &source_change);
+            }
+        }
+        let owned_agents = managed
+            .existing_record
+            .enabled
+            .iter()
+            .map(|id| context.registry.get(id.as_str()))
+            .collect::<yasm_core::Result<Vec<_>>>()?;
+        let links_healthy = owned_agents.iter().all(|agent| {
+            let Ok(expected) = context
+                .lifecycle()
+                .skill_link_target(agent, &managed.skill_id)
+            else {
+                return false;
+            };
+            std::fs::read_link(agent.skill_link(&managed.skill_id))
+                .is_ok_and(|target| target == expected.as_std_path())
+        });
+        if !diff.changed
+            && locked_agents == managed.existing_record.enabled
+            && same_upstream
+            && links_healthy
+        {
+            if let Some(record) = lock.skills.get_mut(&managed.skill_id) {
+                record.source = source.clone();
+                record.skill_path = managed.skill.skill_path.clone();
+                record.resolved = fetched.resolved.clone();
+                record.digest = digest_skill_tree(&installed_path)?;
+            }
+            lock.write(&context.paths.lock_file())?;
             unchanged_updates.push(managed.skill_id);
             continue;
         }
@@ -2601,7 +2703,14 @@ fn add(
         if !prepared.diff.changed {
             context
                 .lifecycle()
-                .enable(&mut lock, &managed.skill_id, &agents, false)?;
+                .enable(&mut lock, &managed.skill_id, &managed.agents, false)?;
+            if let Some(record) = lock.skills.get_mut(&managed.skill_id) {
+                record.source = source.clone();
+                record.skill_path = managed.skill.skill_path.clone();
+                record.resolved = fetched.resolved.clone();
+                record.digest = digest_skill_tree(&context.store.skill_dir(&managed.skill_id))?;
+            }
+            lock.write(&context.paths.lock_file())?;
             println!("updated {}", managed.skill_id);
             continue;
         }
@@ -2621,6 +2730,7 @@ fn add(
                 selected_skill: (*managed.skill).clone(),
                 diff: prepared.diff,
             },
+            agents: managed.agents,
         });
     }
 
@@ -2632,7 +2742,13 @@ fn add(
         for prepared in changed_updates {
             if apply_update_action(&prepared.candidate, action, false)? {
                 let skill_id = prepared.candidate.skill_id.clone();
-                apply_update_candidate(context, &mut lock, prepared.candidate, &agents, false)?;
+                apply_update_candidate(
+                    context,
+                    &mut lock,
+                    prepared.candidate,
+                    &prepared.agents,
+                    false,
+                )?;
                 println!("updated {}", skill_id);
             } else {
                 println!("skipped {}", prepared.candidate.skill_id);
@@ -2643,7 +2759,7 @@ fn add(
     if !install_candidates.is_empty() {
         let action = match effective_action {
             Some(action) => action,
-            None => select_add_action(&agents, &install_candidates)?,
+            None => select_add_action(&install_candidates)?,
         };
         for candidate in install_candidates {
             if action == ChangeAction::Skip {
@@ -2678,19 +2794,17 @@ fn add(
                 continue;
             }
 
-            apply_install_candidate(context, &mut lock, &source, &fetched, candidate, &agents)?;
+            apply_install_candidate(context, &mut lock, &source, &fetched, candidate)?;
         }
     }
 
-    if bundled {
+    if let Some(bundle) = &bundle {
         let installed = acquired_self_member_ids(&lock);
-        let complete = self_bundle_skills().iter().all(|skill| {
-            SkillId::parse(skill.id).is_ok_and(|skill_id| installed.contains(&skill_id))
-        });
+        let complete = bundle.members().is_subset(&installed);
         if complete && lock.bundles.contains_key(SELF_BUNDLE_ID) {
-            reconcile_self_bundle(context, &mut lock, effective_action, false)?;
+            reconcile_self_bundle(context, &mut lock, bundle, &source, effective_action, false)?;
         }
-        refresh_self_bundle_receipt(context, &mut lock, &fetched, &agents)?;
+        refresh_self_bundle_receipt(context, &mut lock, bundle, &agents)?;
     }
 
     Ok(())
@@ -2711,52 +2825,20 @@ fn validate_reserved_skill_ids(discovered: &[&DiscoveredSkill], bundled: bool) -
     Ok(())
 }
 
-fn validate_self_bundle_manifest(discovered: &[DiscoveredSkill]) -> Result<()> {
-    let discovered = discovered
-        .iter()
-        .map(|skill| sanitize_skill_id(&skill.name))
-        .collect::<yasm_core::Result<BTreeSet<_>>>()?;
-    let declared = self_bundle_skills()
-        .iter()
-        .map(|skill| SkillId::parse(skill.id))
-        .collect::<yasm_core::Result<BTreeSet<_>>>()?;
-    if discovered != declared {
-        anyhow::bail!("embedded self bundle manifest does not match its skill contents");
-    }
-    Ok(())
-}
-
 fn refresh_self_bundle_receipt(
     context: &ScopeContext,
     lock: &mut LockFile,
-    fetched: &FetchedSource,
+    bundle: &SelfBundle<'_>,
     agents: &[&Agent],
 ) -> Result<()> {
-    let discovery = discover_skills_with_diagnostics(&fetched.root)?;
-    validate_self_bundle_manifest(&discovery.skills)?;
-    let members = discovery
-        .skills
-        .iter()
-        .map(|skill| sanitize_skill_id(&skill.name))
-        .collect::<yasm_core::Result<BTreeSet<_>>>()?;
+    let members = bundle.members();
     let installed = acquired_self_member_ids(lock);
     if installed.is_empty() {
         return Ok(());
     }
 
-    for skill in &discovery.skills {
-        let skill_id = sanitize_skill_id(&skill.name)?;
-        if !installed.contains(&skill_id) {
-            continue;
-        }
-        let diff = skill_directory_diff(
-            &skill_id,
-            &context.store.skill_dir(&skill_id),
-            &skill.directory,
-        )?;
-        if diff.changed {
-            return Ok(());
-        }
+    if !bundle.matches_installed_contents(context, &installed)? {
+        return Ok(());
     }
 
     let previous = lock.bundles.get(SELF_BUNDLE_ID).cloned();
@@ -2765,15 +2847,6 @@ fn refresh_self_bundle_receipt(
         .map(|record| record.enabled.clone())
         .unwrap_or_default();
     enabled.extend(agent_ids(agents));
-    let mut member_enabled = previous
-        .as_ref()
-        .map(|record| record.member_enabled.clone())
-        .unwrap_or_default();
-    for skill_id in &installed {
-        if let Some(record) = lock.skills.get(skill_id) {
-            member_enabled.insert(skill_id.clone(), record.enabled.clone());
-        }
-    }
     let mut excluded = previous
         .as_ref()
         .map(|record| record.excluded.clone())
@@ -2784,19 +2857,7 @@ fn refresh_self_bundle_receipt(
         excluded.remove(skill_id);
     }
     excluded.extend(members.difference(&installed).cloned());
-    lock.bundles.insert(
-        SELF_BUNDLE_ID.to_string(),
-        LockedBundleRecord {
-            release: env!("CARGO_PKG_VERSION").to_string(),
-            digest: self_bundle_digest(),
-            members,
-            excluded,
-            enabled,
-            member_enabled,
-        },
-    );
-    lock.write(&context.paths.lock_file())?;
-    Ok(())
+    bundle.write_receipt(context, lock, previous.as_ref(), excluded, enabled)
 }
 
 fn apply_install_candidate(
@@ -2805,8 +2866,8 @@ fn apply_install_candidate(
     source: &SourceSpec,
     fetched: &FetchedSource,
     candidate: AddInstallCandidate<'_>,
-    agents: &[&Agent],
 ) -> Result<()> {
+    let agents = &candidate.agents;
     let skill_id = candidate.skill_id;
     let install_progress = progress::Progress::start(format!("Acquiring {skill_id} ..."), false);
     let lifecycle = context.lifecycle();
@@ -3605,14 +3666,30 @@ fn update(
         }
     }
 
-    let bundle_changes = if reconcile_bundle {
-        reconcile_self_bundle(context, &mut lock, requested_action, json_output)?
+    let bundle_changes = if reconcile_bundle || refresh_bundle_receipt {
+        let source = SourceInput::Bundled.into_spec()?;
+        let fetched = match fetched_checkouts.get(&SourceCheckoutKey::from(&source)) {
+            Some(Ok(checkout)) => resolve_fetched_source(&source, checkout)?,
+            _ => fetch_source_cached(&source, &context.paths.cache_dir.join("sources"))?,
+        };
+        let discovery = discover_skills_with_diagnostics(&fetched.root)?;
+        let bundle = SelfBundle::from_skills(&discovery.skills)?;
+        if reconcile_bundle {
+            reconcile_self_bundle(
+                context,
+                &mut lock,
+                &bundle,
+                &source,
+                requested_action,
+                json_output,
+            )?
+        } else {
+            refresh_self_bundle_receipt_if_converged(context, &mut lock, &bundle)?;
+            BundleReconcileResult::default()
+        }
     } else {
         BundleReconcileResult::default()
     };
-    if refresh_bundle_receipt {
-        refresh_self_bundle_receipt_if_converged(context, &mut lock)?;
-    }
     skipped.extend(bundle_changes.skipped);
     if !json_output
         && failed.is_empty()
@@ -3662,23 +3739,16 @@ struct BundleReconcileResult {
 fn reconcile_self_bundle(
     context: &ScopeContext,
     lock: &mut LockFile,
+    bundle: &SelfBundle<'_>,
+    source: &SourceSpec,
     requested_action: Option<ChangeAction>,
     json_output: bool,
 ) -> Result<BundleReconcileResult> {
     let Some(mut previous) = lock.bundles.get(SELF_BUNDLE_ID).cloned() else {
         anyhow::bail!("the `self` bundle is not acquired; run `yasm add self --action apply`");
     };
-    previous.member_enabled = bundle_member_enabled(lock, &previous);
-    let source = SourceInput::Bundled.into_spec()?;
-    let fetched = fetch_source_cached(&source, &context.paths.cache_dir.join("sources"))?;
-    let discovery = discover_skills_with_diagnostics(&fetched.root)?;
-    validate_self_bundle_manifest(&discovery.skills)?;
-    let current = discovery
-        .skills
-        .into_iter()
-        .map(|skill| Ok((sanitize_skill_id(&skill.name)?, skill)))
-        .collect::<yasm_core::Result<BTreeMap<_, _>>>()?;
-    let current_ids = current.keys().cloned().collect::<BTreeSet<_>>();
+    previous.member_enabled = bundle_member_enabled(lock, Some(&previous));
+    let current_ids = bundle.members();
     let acquired = acquired_self_member_ids(lock);
     let current_exclusions = previous.excluded.clone();
     let additions = current_ids
@@ -3764,9 +3834,9 @@ fn reconcile_self_bundle(
         }
 
         for skill_id in &additions {
-            let skill = current
-                .get(skill_id)
-                .expect("bundle additions originate from current skills");
+            let skill = bundle.skill(skill_id).ok_or_else(|| {
+                anyhow::anyhow!("bundle addition `{skill_id}` is missing from the current bundle")
+            })?;
             let enabled = bundle_member_agents(&previous, skill_id);
             let agents = enabled
                 .iter()
@@ -3776,7 +3846,7 @@ fn reconcile_self_bundle(
                 lock,
                 skill_id,
                 skill.name.clone(),
-                fetched.source.clone(),
+                source.clone(),
                 None,
                 skill.skill_path.clone(),
                 &skill.directory,
@@ -3801,20 +3871,14 @@ fn reconcile_self_bundle(
         }
     }
 
-    if self_bundle_is_converged(context, lock, &current, &current_exclusions)? {
-        let member_enabled = bundle_member_enabled(lock, &previous);
-        lock.bundles.insert(
-            SELF_BUNDLE_ID.to_string(),
-            LockedBundleRecord {
-                release: env!("CARGO_PKG_VERSION").to_string(),
-                digest: self_bundle_digest(),
-                members: current_ids,
-                excluded: current_exclusions,
-                enabled: previous.enabled,
-                member_enabled,
-            },
-        );
-        lock.write(&context.paths.lock_file())?;
+    if bundle.is_converged(context, lock, &current_exclusions)? {
+        bundle.write_receipt(
+            context,
+            lock,
+            Some(&previous),
+            current_exclusions,
+            previous.enabled.clone(),
+        )?;
     }
     Ok(result)
 }
@@ -3822,35 +3886,19 @@ fn reconcile_self_bundle(
 fn refresh_self_bundle_receipt_if_converged(
     context: &ScopeContext,
     lock: &mut LockFile,
+    bundle: &SelfBundle<'_>,
 ) -> Result<()> {
     let Some(previous) = lock.bundles.get(SELF_BUNDLE_ID).cloned() else {
         return Ok(());
     };
-    let source = SourceInput::Bundled.into_spec()?;
-    let fetched = fetch_source_cached(&source, &context.paths.cache_dir.join("sources"))?;
-    let discovery = discover_skills_with_diagnostics(&fetched.root)?;
-    validate_self_bundle_manifest(&discovery.skills)?;
-    let current = discovery
-        .skills
-        .into_iter()
-        .map(|skill| Ok((sanitize_skill_id(&skill.name)?, skill)))
-        .collect::<yasm_core::Result<BTreeMap<_, _>>>()?;
-    let current_ids = current.keys().cloned().collect::<BTreeSet<_>>();
-    let exclusions = previous.excluded.clone();
-    if self_bundle_is_converged(context, lock, &current, &exclusions)? {
-        let member_enabled = bundle_member_enabled(lock, &previous);
-        lock.bundles.insert(
-            SELF_BUNDLE_ID.to_string(),
-            LockedBundleRecord {
-                release: env!("CARGO_PKG_VERSION").to_string(),
-                digest: self_bundle_digest(),
-                members: current_ids,
-                excluded: exclusions,
-                enabled: previous.enabled,
-                member_enabled,
-            },
-        );
-        lock.write(&context.paths.lock_file())?;
+    if bundle.is_converged(context, lock, &previous.excluded)? {
+        bundle.write_receipt(
+            context,
+            lock,
+            Some(&previous),
+            previous.excluded.clone(),
+            previous.enabled.clone(),
+        )?;
     }
     Ok(())
 }
@@ -3861,53 +3909,6 @@ fn bundle_member_agents(previous: &LockedBundleRecord, new_id: &SkillId) -> BTre
         .get(new_id)
         .unwrap_or(&previous.enabled)
         .clone()
-}
-
-fn bundle_member_enabled(
-    lock: &LockFile,
-    previous: &LockedBundleRecord,
-) -> BTreeMap<SkillId, BTreeSet<AgentId>> {
-    let mut enabled = previous.member_enabled.clone();
-    for (skill_id, record) in &lock.skills {
-        if record.source.kind == SourceKind::Bundled && record.source.path == SELF_BUNDLE_ID {
-            enabled.insert(skill_id.clone(), record.enabled.clone());
-        }
-    }
-    enabled
-}
-
-fn self_bundle_is_converged(
-    context: &ScopeContext,
-    lock: &LockFile,
-    current: &BTreeMap<SkillId, DiscoveredSkill>,
-    excluded: &BTreeSet<SkillId>,
-) -> Result<bool> {
-    for (skill_id, skill) in current {
-        if excluded.contains(skill_id) {
-            if lock.skills.contains_key(skill_id) {
-                return Ok(false);
-            }
-            continue;
-        }
-        let Some(record) = lock.skills.get(skill_id) else {
-            return Ok(false);
-        };
-        if record.source.kind != SourceKind::Bundled || record.source.path != SELF_BUNDLE_ID {
-            return Ok(false);
-        }
-        if skill_directory_diff(
-            skill_id,
-            &context.store.skill_dir(skill_id),
-            &skill.directory,
-        )?
-        .changed
-        {
-            return Ok(false);
-        }
-    }
-    Ok(acquired_self_member_ids(lock)
-        .iter()
-        .all(|skill_id| current.contains_key(skill_id)))
 }
 
 fn check_update_candidate(
@@ -4099,6 +4100,8 @@ struct AddManagedCandidate<'a> {
     skill_id: SkillId,
     skill: &'a DiscoveredSkill,
     existing_record: LockedSkillRecord,
+    same_upstream: bool,
+    agents: Vec<&'a Agent>,
 }
 
 struct PreparedManagedAddCandidate<'a> {
@@ -4110,10 +4113,12 @@ struct AddInstallCandidate<'a> {
     skill_id: SkillId,
     skill: &'a DiscoveredSkill,
     replacements: BTreeSet<Utf8PathBuf>,
+    agents: Vec<&'a Agent>,
 }
 
-struct PreparedAddUpdate {
+struct PreparedAddUpdate<'a> {
     candidate: UpdateCandidate,
+    agents: Vec<&'a Agent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -4222,10 +4227,7 @@ fn add_replacement_targets(
     Ok(replacements)
 }
 
-fn select_add_action(
-    agents: &[&Agent],
-    candidates: &[AddInstallCandidate<'_>],
-) -> Result<ChangeAction> {
+fn select_add_action(candidates: &[AddInstallCandidate<'_>]) -> Result<ChangeAction> {
     let has_replacements = candidates
         .iter()
         .any(|candidate| !candidate.replacements.is_empty());
@@ -4246,7 +4248,11 @@ fn select_add_action(
         if !candidate.replacements.is_empty() {
             print_existing_skill_message(
                 &candidate.skill_id,
-                &replacement_agent_ids(agents, &candidate.skill_id, &candidate.replacements)?,
+                &replacement_agent_ids(
+                    &candidate.agents,
+                    &candidate.skill_id,
+                    &candidate.replacements,
+                )?,
             );
         }
     }
@@ -4526,7 +4532,11 @@ fn skill_source_directory_diff_with_labels(
         let installed_path = installed.join(&path);
         let candidate_path = candidate.join(&path);
         let installed_entry = diff_entry(&installed_path)?;
-        let candidate_entry = diff_entry(&candidate_path)?;
+        let candidate_entry = if candidate_files.contains(&path) {
+            diff_entry(&candidate_path)?
+        } else {
+            DiffEntry::Missing
+        };
         if installed_entry == candidate_entry {
             continue;
         }
@@ -5007,51 +5017,83 @@ fn remove(context: &ScopeContext, skills: &[String], all: bool, json_output: boo
     Ok(())
 }
 
-fn select_skills<'a>(
-    discovered: &'a [DiscoveredSkill],
+fn select_add_skills<'plan, 'skill>(
+    plan: &'plan [add_plan::PlannedSkill<'skill>],
     selection: Option<&str>,
-) -> Result<Vec<&'a DiscoveredSkill>> {
+) -> Result<Vec<&'plan add_plan::PlannedSkill<'skill>>> {
     if let Some(selection) = selection {
-        let matches = discovered
+        let matches = plan
             .iter()
-            .filter(|skill| skill.name.as_str() == selection)
+            .filter(|planned| {
+                planned.skill.name.as_str() == selection
+                    || planned.skill.skill_path.as_str() == selection
+            })
             .collect::<Vec<_>>();
         return match matches.as_slice() {
             [] => anyhow::bail!(
                 "skill `{selection}` was not found; available skills: {}",
-                discovered_skill_names(discovered)
+                if plan.is_empty() {
+                    "none".to_string()
+                } else {
+                    plan.iter()
+                        .map(|planned| planned.skill.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
             ),
             [skill] => Ok(vec![*skill]),
-            _ => {
-                let mut paths = matches
+            _ => anyhow::bail!(
+                "skill `{selection}` is ambiguous; pass --skill <repository-relative SKILL.md path>; matching paths: {}",
+                matches
                     .iter()
-                    .map(|skill| skill.skill_path.as_str())
-                    .collect::<Vec<_>>();
-                paths.sort_unstable();
-                anyhow::bail!(
-                    "skill `{selection}` is ambiguous; matching paths: {}",
-                    paths.join(", ")
-                )
-            }
+                    .map(|planned| planned.skill.skill_path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         };
     }
-    if discovered.is_empty() {
+    if plan.is_empty() {
         anyhow::bail!("no valid skills found in source");
     }
-    if discovered.len() == 1 {
-        return Ok(vec![&discovered[0]]);
-    }
-
-    let labels = discovered
+    let installed = plan
         .iter()
-        .map(display_discovered_skill)
+        .filter(|planned| planned.state == add_plan::AddSkillState::Installed)
         .collect::<Vec<_>>();
-    let defaults = vec![false; labels.len()];
+    if !installed.is_empty() {
+        println!("Already installed from this source:");
+        for planned in &installed {
+            println!("✔ {}", display_discovered_skill(planned.skill));
+        }
+        println!();
+    }
+    let available = plan
+        .iter()
+        .filter(|planned| planned.state != add_plan::AddSkillState::Installed)
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Preserve automatic selection only for a source containing a single skill.
+    // Even one remaining skill in a larger source needs an explicit choice.
+    if plan.len() == 1 {
+        return Ok(vec![available[0]]);
+    }
+    let labels = available
+        .iter()
+        .map(|planned| {
+            let label = display_discovered_skill(planned.skill);
+            if planned.state == add_plan::AddSkillState::Conflict {
+                format!("{label} (different installed source; requires --replace)")
+            } else {
+                label
+            }
+        })
+        .collect::<Vec<_>>();
     let selections = interactive::ask_multiselect(
         "skills",
-        "Select skills to install",
+        "Select additional skills to install",
         &labels,
-        &defaults,
+        &vec![false; labels.len()],
         "pass --skill <name> to choose a skill explicitly",
     )?;
     if selections.is_empty() {
@@ -5059,7 +5101,7 @@ fn select_skills<'a>(
     }
     Ok(selections
         .into_iter()
-        .filter_map(|idx| discovered.get(idx))
+        .filter_map(|index| available.get(index).copied())
         .collect())
 }
 
@@ -5245,18 +5287,6 @@ fn installed_skill_ids(lock: &LockFile) -> String {
         lock.skills
             .keys()
             .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
-fn discovered_skill_names(discovered: &[DiscoveredSkill]) -> String {
-    if discovered.is_empty() {
-        "none".to_string()
-    } else {
-        discovered
-            .iter()
-            .map(|skill| skill.name.to_string())
             .collect::<Vec<_>>()
             .join(", ")
     }
