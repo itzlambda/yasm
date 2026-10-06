@@ -14,7 +14,9 @@ pub struct MarketplaceArgs {
 enum MarketplaceCommand {
     #[command(about = "Register and fetch a plugin marketplace catalog")]
     Add {
-        #[arg(help = "Local path, GitHub owner/repo shorthand, or repository URL")]
+        #[arg(
+            help = "Local path, GitHub owner/repo shorthand, repository URL, or SCP-style user@host:path"
+        )]
         source: String,
         #[arg(long, help = "Registry name to use instead of the catalog name")]
         alias: Option<String>,

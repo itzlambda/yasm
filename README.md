@@ -29,65 +29,19 @@ consistent workflow:
 
 ## Installation
 
-Install the latest stable release with [scripts/install.sh](scripts/install.sh).
-A tagged build is published as a prerelease first. Mark it as a full release
-after verifying it; until then the installer and `yasm self-upgrade` leave it
-alone.
+Install the latest stable release on Linux or macOS:
 
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/itzlambda/yasm/main/scripts/install.sh | sh
+```sh
+curl -fsSL https://yasm.itzlambda.com/install | sh
 ```
 
-The script checks the release checksum and installs `yasm` to `~/.yasm/bin`.
-When a terminal is available it asks before adding that directory to your `PATH`.
-It updates the startup files of every shell it finds: `~/.profile`, `~/.bashrc`,
-`~/.zshenv`, and `~/.config/fish/conf.d/yasm.fish`. If `~/.local/bin` is already
-on your `PATH`, it also links `yasm` there so the current shell can run it
-immediately. Pass `-y` to accept the `PATH` change without a prompt:
+Requires `git`. On Windows, use WSL with your project on the Linux filesystem.
 
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/itzlambda/yasm/main/scripts/install.sh | sh -s -- -y
-```
+To upgrade:
 
-Yasm also requires `git` on `PATH` to fetch GitHub sources.
-
-Upgrade that install from later GitHub releases with:
-
-```bash
+```sh
 yasm self-upgrade
 ```
-
-In a terminal, `yasm self-upgrade` asks before replacing the binary. Pass `--yes`
-to upgrade without a prompt. It installs the newest stable release.
-
-The script installs one of these binaries:
-
-| Platform | Binary |
-| --- | --- |
-| Linux x86_64 | `yasm-x86_64-unknown-linux-musl` |
-| Linux arm64 | `yasm-aarch64-unknown-linux-musl` |
-| macOS Apple Silicon | `yasm-aarch64-apple-darwin` |
-| macOS Intel | `yasm-x86_64-apple-darwin` |
-
-Linux binaries are statically linked. macOS binaries are unsigned. The install
-script removes the download quarantine attribute. If Gatekeeper still blocks the
-first launch, open the binary from Finder. A `cargo install` build on Linux uses
-the gnu target, so `yasm self-upgrade` does not match these musl binaries.
-
-To build from source instead, install Rust and Cargo, then:
-
-```bash
-git clone https://github.com/itzlambda/yasm.git
-cd yasm
-cargo install --path crates/yasm-cli --locked
-yasm --version
-```
-
-Cargo installs into `~/.cargo/bin`, which also needs to be on your `PATH`.
-
-Linux and macOS are supported. On Windows, use WSL with your project on the Linux
-filesystem. Native Windows requires Git `core.symlinks=true` and permission to
-create directory symlinks.
 
 ## Quick start
 
@@ -128,48 +82,33 @@ yasm init --action review
 yasm init --action apply
 ```
 
-For an existing Yasm project, use `yasm migrate --action apply`. To adopt global
-skills, use `yasm migrate --global --action apply`. In an interactive terminal,
-Yasm first shows recorded and recommended GitHub sources and lets you accept
-them, then asks whether each remaining skill should be kept as local, assigned a
-different GitHub source, or left unmanaged for now. Migration preserves the
-installed files; accepting a source only configures where a later update checks.
-The original installed revision remains unknown until an applied update verifies
-the complete installed tree or installs fetched content.
+For an existing Yasm project, use `yasm migrate --action apply`. Add `--global`
+to adopt global skills. Migration preserves installed files and lets you choose
+an upstream source for future updates.
 
-The same choices are available without prompts:
+To adopt a specific skill without prompting:
 
 ```bash
-# Adopt only candidates with recorded or recommended upstreams.
-yasm migrate --with-upstream --action apply
-
-# Keep one candidate as a locally owned skill.
 yasm migrate --skill team-review --source local --action apply
-
-# Validate and attach a different GitHub source while preserving installed files.
-yasm migrate --skill humanizer --source blader/humanizer --action apply
 ```
 
-`--skill` may be repeated to restrict the eligible set. A GitHub `--source`
-requires exactly one selected skill; `--source local` can apply to several.
-Omitting both `--with-upstream` and `--source` retains the existing
-`--action apply` behavior of adopting every eligible candidate. Use the same
-options with `init` when creating a project store.
+See `yasm migrate --help` for source selection and filtering options.
 
-Global migration follows symlinked agent directories (including symlinked
-`.agents` or `.claude` parents), preserving those directory links. When agents
-share a physical skill directory, each skill is migrated once and enabled for
-both agents. Recovery checks that the directory still resolves to its recorded
-location before restoring files. Project migration continues to skip symlinked
-agent directories.
+### Private repositories over SSH
 
-If an unmanaged agent directory has the same skill ID as a managed skill,
-migration compares their complete file trees. An identical copy is adopted by
-linking it to the existing store while preserving the stored skill and its lock
-metadata. Different copies, a missing store directory, or a store directory
-without a lock record appear as conflicts during review and must be repaired
-before that skill can be applied. Use `--skill <name>` to migrate unrelated
-skills without applying a reported conflict.
+Use an SCP-style Git address to install skills from a private repository:
+
+```bash
+yasm add git@github.com:team/private-skills.git --skill code-review --global --action apply
+```
+
+Set up repository access and host trust with Git and SSH first. Yasm uses your
+existing SSH configuration and keys, but does not prompt for passwords or
+passphrases. GitHub `owner/repo` shorthand uses HTTPS; use an SCP-style address
+for SSH.
+
+Committing `.yasm/` shares installed skill contents with everyone who can access
+the project, even when the upstream repository is private.
 
 ### Choose which agents use a skill
 
@@ -218,12 +157,6 @@ yasm doctor --repair
 dangling Yasm-owned links. For scripts, commands such as `list` and `status`
 also support `--json`. Supply choices explicitly in scripts: non-TTY commands
 never prompt and report any missing arguments.
-
-Yasm supports only its current stored-state formats: version 3 for `yasm.lock`
-and version 1 for marketplace state, with current receipt and journal fields.
-There is no automatic upgrade of older development state. Recreate unsupported
-state with the current executable; keep skill files and any recovery backups
-until that is complete.
 
 ### Adopt existing agent files
 
@@ -276,77 +209,30 @@ the link with that file; retain the stored copy until restoration is verified.
 
 ### Manage plugin marketplaces (experimental)
 
-**Marketplace and plugin support is experimental.** Commands, behavior, and
-stored data formats may change incompatibly, and support may be removed in a
-future release.
-
-The default `marketplace` feature imports Codex, Claude Code, and Cursor
-marketplace formats into one Yasm-owned lifecycle. Catalog format, package
-format, and output target are independent, so a portable skill from one source
-can be enabled for another supported agent.
+**Marketplace and plugin support is experimental and may change incompatibly.**
+Yasm supports Codex, Claude Code, and Cursor marketplace formats.
 
 ```bash
-# Register and inspect a catalog.
+# Register a catalog and browse its plugins.
 yasm marketplace add ./my-marketplace --alias local
 yasm plugin list --available --marketplace local
 
-# Snapshot a package and expose its supported components to Codex.
+# Install a plugin for Codex.
 yasm plugin add example@local --agent codex
 yasm plugin info example@local
 
-# Show standalone skills plus one summary row per installed plugin.
-yasm list
-
-# Reconcile or remove the managed outputs later.
+# Update or remove it.
 yasm plugin update example@local
 yasm plugin remove example@local --all
 ```
 
-Yasm snapshots the complete package, while only skills and supported MCP
-definitions are exported. Enablement is all-or-nothing: plugins with unsupported
-components or configuration cannot be enabled. Use `--no-enable` to acquire a
-package for inspection with `yasm plugin info`; there is no partial-export flag.
-Yasm does not provide per-component selection.
-
-Marketplace import rejects literal credentials in recognised MCP environment
-variables and headers, MCP URLs, credential URLs embedded in commands and
-arguments, and nested extension data, including URL `sig` parameters. It also
-rejects defaults on sensitive inputs and credentials
-inside other input defaults or constraints. Symbolic environment and input
-references remain available for target configuration. JSON inspection and debug
-output redact non-symbolic MCP environment and header values, credential URLs
-embedded in commands, arguments, source URLs, and nested input data, sensitive
-input defaults, and retained extension data. Internal state and target rendering
-keep the original values needed for reconciliation; treat marketplace state and
-package snapshots as sensitive files.
-
-Skill links point to isolated copies containing `SKILL.md`, `scripts/`,
-`references/`, `assets/`, and optional `agents/openai.yaml`. Native plugin
-manifests and configuration are never exposed through those links. Other
-package files remain in the source snapshot, where MCP commands can use them.
-Name collisions require explicit `--skill-alias` or `--mcp-alias` mappings.
-
-Output changes and installation receipts are journaled together. Failed
-operations roll back their output changes; interrupted operations recover on
-the next marketplace or plugin mutation. Recovery and receipt-based cleanup
-refuse to overwrite entries or links changed outside Yasm.
-
-Marketplace state is independent from the ordinary `yasm.lock` schema and the
-feature remains removable. `yasm list` reads that state to present installed
-plugins once per project/global scope with enabled/installed component counts;
-the terminal table adds a concise package summary and JSON retains the full
-description. `yasm plugin info` shows the complete inventory and each
-component's enabled targets. Neither command copies plugin records into
-`yasm.lock`. Disable or remove managed outputs before building without the
-feature:
-
-```bash
-yasm plugin remove example@local --all
-cargo build -p yasm-cli --no-default-features
-```
+Plugins can expose skills and supported MCP definitions. Plugins with unsupported
+components cannot be enabled; use `--no-enable` to install them for inspection.
+Use environment or input references for credentials rather than literal secrets
+in a catalog, and treat local marketplace state and package snapshots as sensitive.
 
 See [plugin runtime validation](docs/plugin-runtime-validation.md) for tested
-client versions and the remaining live-client acceptance checks.
+client versions and outstanding compatibility checks.
 
 ## How it works
 
@@ -380,30 +266,9 @@ The workspace separates reusable functionality from the command-line interface:
 | [`yasm-marketplace`](crates/yasm-marketplace/src/lib.rs) | Experimental marketplace import, package snapshots, and target-specific plugin deployment. |
 | [`yasm-cli`](crates/yasm-cli/src/main.rs) | Commands, interactive choices, and terminal output built on the libraries. |
 
-For example, another Rust project can discover skills in a local directory
-without invoking the CLI. Add these dependencies to that project's `Cargo.toml`:
-
-```toml
-[dependencies]
-camino = "1"
-yasm-core = { git = "https://github.com/itzlambda/yasm.git" }
-```
-
-```rust
-use camino::Utf8Path;
-use yasm_core::{discover_skills, Result};
-
-fn main() -> Result<()> {
-    for skill in discover_skills(Utf8Path::new("./skills"))? {
-        println!("{}: {}", skill.name.as_str(), skill.directory);
-    }
-    Ok(())
-}
-```
-
-The crates are currently version `0.0.1`; treat the APIs as evolving and pin a Git
-revision for integrations that need a fixed dependency. From a Yasm checkout,
-generate API documentation with `cargo doc --workspace --no-deps --open`.
+The library APIs are evolving; pin a Git revision for integrations that need a
+fixed dependency. Generate API documentation from a checkout with
+`cargo doc --workspace --no-deps --open`.
 
 ## Help
 
@@ -413,10 +278,17 @@ generate API documentation with `cargo doc --workspace --no-deps --open`.
 
 ## Contributing
 
-Clone the repository using the installation steps above. Use
-`cargo run -p yasm-cli -- --help` to run the CLI from your checkout and
-`cargo test --workspace --all-features` to run the tests.
+To build from source, install Rust and Cargo, then:
 
-Read [AGENTS.md](AGENTS.md) for project conventions. Before submitting a pull
-request, install [Just](https://github.com/casey/just) and run `just lint`, which
-checks workspace dependencies, formatting, Clippy warnings, and tests.
+```sh
+git clone https://github.com/itzlambda/yasm.git
+cd yasm
+cargo install --path crates/yasm-cli --locked
+```
+
+Make sure `~/.cargo/bin` is on your `PATH`. During development, use
+`cargo run -p yasm-cli -- --help` to run the CLI from your checkout.
+
+Read [AGENTS.md](AGENTS.md) for project conventions. Before submitting changes,
+install [Just](https://github.com/casey/just) and run `just lint` to check workspace
+dependencies, formatting, Clippy warnings, and tests.

@@ -2714,7 +2714,9 @@ version = "0.0.1"
 dependencies = [
  "camino",
  "etcetera",
+ "rustix",
  "sha2 0.10.9",
+ "shlex",
  "tempfile",
  "yasm-core",
 ]
