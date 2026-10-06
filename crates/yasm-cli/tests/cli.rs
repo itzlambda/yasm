@@ -373,6 +373,152 @@ fn individual_bundle_update_refreshes_bundle_receipt() {
 }
 
 #[test]
+fn individual_bundle_update_keeps_receipt_stale_until_membership_converges() {
+    let data = tempdir().unwrap();
+    let agents = tempdir().unwrap();
+    assert!(yasm_with_roots(data.path(), agents.path())
+        .args([
+            "add",
+            "self",
+            "--global",
+            "--no-enable",
+            "--action",
+            "apply"
+        ])
+        .status()
+        .unwrap()
+        .success());
+
+    let lock_path = data.path().join("yasm.lock");
+    let mut lock: Value = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    let mut retired = lock["skills"]["yasm"].clone();
+    retired["name"] = serde_json::json!("retired");
+    retired["skill_path"] = serde_json::json!("retired/SKILL.md");
+    lock["skills"]["retired"] = retired;
+    lock["bundles"]["self"]["members"] = serde_json::json!(["retired", "yasm"]);
+    lock["bundles"]["self"]["release"] = serde_json::json!("older-release");
+    lock["bundles"]["self"]["digest"] = serde_json::json!("older-bundle");
+    std::fs::write(&lock_path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+    std::fs::write(data.path().join("skills/yasm/SKILL.md"), "local edit\n").unwrap();
+
+    let update = yasm_with_roots(data.path(), agents.path())
+        .args(["update", "yasm", "--global", "--action", "apply"])
+        .output()
+        .unwrap();
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    assert!(String::from_utf8_lossy(&update.stdout).contains("updated yasm"));
+    let actual: Value = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    assert_eq!(actual["bundles"]["self"], lock["bundles"]["self"]);
+    assert_eq!(actual["skills"]["retired"], lock["skills"]["retired"]);
+    assert_eq!(
+        std::fs::read_to_string(data.path().join("skills/yasm/SKILL.md")).unwrap(),
+        "---\nname: yasm\ndescription: TODO\n---\n\nTODO\n"
+    );
+}
+
+#[test]
+fn skipped_bundle_changes_preserve_receipts_and_local_contents() {
+    let data = tempdir().unwrap();
+    let agents = tempdir().unwrap();
+    assert!(yasm_with_roots(data.path(), agents.path())
+        .args(["add", "self", "--global", "--agent", "claude", "--action", "apply"])
+        .status()
+        .unwrap()
+        .success());
+
+    let lock_path = data.path().join("yasm.lock");
+    let mut lock: Value = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    lock["bundles"]["self"]["release"] = serde_json::json!("older-release");
+    lock["bundles"]["self"]["digest"] = serde_json::json!("older-bundle");
+    std::fs::write(&lock_path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+    let skill_path = data.path().join("skills/yasm/SKILL.md");
+    std::fs::write(&skill_path, "local edit\n").unwrap();
+
+    for args in [
+        vec!["update", "self", "--global", "--action", "skip"],
+        vec!["update", "yasm", "--global", "--action", "skip"],
+        vec!["add", "self", "--global", "--no-enable", "--action", "skip"],
+    ] {
+        let output = yasm_with_roots(data.path(), agents.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual: Value = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+        assert_eq!(actual, lock, "{args:?} changed the lockfile");
+        assert_eq!(
+            std::fs::read_to_string(&skill_path).unwrap(),
+            "local edit\n"
+        );
+    }
+}
+
+#[test]
+fn self_bundle_update_restores_missing_members_with_saved_agent_selection() {
+    let data = tempdir().unwrap();
+    let agents = tempdir().unwrap();
+    assert!(yasm_with_roots(data.path(), agents.path())
+        .args(["add", "self", "--global", "--agent", "claude", "--action", "apply"])
+        .status()
+        .unwrap()
+        .success());
+
+    let lock_path = data.path().join("yasm.lock");
+    let mut lock: Value = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    let expected_digest = lock["bundles"]["self"]["digest"].clone();
+    lock["skills"].as_object_mut().unwrap().remove("yasm");
+    lock["bundles"]["self"]["enabled"] = serde_json::json!(["universal"]);
+    lock["bundles"]["self"]["digest"] = serde_json::json!("older-bundle");
+    std::fs::write(&lock_path, serde_json::to_vec_pretty(&lock).unwrap()).unwrap();
+    std::fs::remove_dir_all(data.path().join("skills/yasm")).unwrap();
+    std::fs::remove_file(agents.path().join(".claude/skills/yasm")).unwrap();
+
+    let skipped = yasm_with_roots(data.path(), agents.path())
+        .args(["update", "self", "--global", "--action", "skip"])
+        .output()
+        .unwrap();
+    assert!(skipped.status.success());
+    let actual: Value = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    assert_eq!(actual, lock);
+    assert!(!data.path().join("skills/yasm").exists());
+
+    let update = yasm_with_roots(data.path(), agents.path())
+        .args(["update", "self", "--global", "--action", "apply"])
+        .output()
+        .unwrap();
+    assert!(
+        update.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update.stderr)
+    );
+    assert!(String::from_utf8_lossy(&update.stdout).contains("added bundled skill yasm"));
+    let actual: Value = serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
+    assert_eq!(actual["bundles"]["self"]["digest"], expected_digest);
+    assert_eq!(
+        actual["bundles"]["self"]["enabled"],
+        serde_json::json!(["universal"])
+    );
+    assert_eq!(
+        actual["bundles"]["self"]["member_enabled"]["yasm"],
+        serde_json::json!(["claude"])
+    );
+    assert_eq!(
+        actual["skills"]["yasm"]["enabled"],
+        serde_json::json!(["claude"])
+    );
+    assert!(agents.path().join(".claude/skills/yasm/SKILL.md").exists());
+    assert!(!agents.path().join(".agents/skills/yasm").exists());
+}
+
+#[test]
 fn individual_bundle_removal_stays_excluded_until_readded() {
     let data = tempdir().unwrap();
     let agents = tempdir().unwrap();
@@ -398,6 +544,20 @@ fn individual_bundle_removal_stays_excluded_until_readded() {
     assert_eq!(
         lock["bundles"]["self"]["excluded"],
         serde_json::json!(["yasm"])
+    );
+
+    assert!(yasm_with_roots(data.path(), agents.path())
+        .args(["add", "self", "--global", "--agent", "claude", "--action", "apply"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(data.path().join("skills/yasm/SKILL.md").exists());
+    let lock: Value =
+        serde_json::from_slice(&std::fs::read(data.path().join("yasm.lock")).unwrap()).unwrap();
+    assert!(lock["bundles"]["self"].get("excluded").is_none());
+    assert_eq!(
+        lock["skills"]["yasm"]["enabled"],
+        serde_json::json!(["claude"])
     );
 
     assert!(yasm_with_roots(data.path(), agents.path())
