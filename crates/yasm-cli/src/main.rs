@@ -3707,7 +3707,7 @@ fn reconcile_self_bundle(
         }
 
         for skill_id in &additions {
-            let skill = bundle.skills.get(skill_id).ok_or_else(|| {
+            let skill = bundle.skill(skill_id).ok_or_else(|| {
                 anyhow::anyhow!("bundle addition `{skill_id}` is missing from the current bundle")
             })?;
             let enabled = bundle_member_agents(&previous, skill_id);

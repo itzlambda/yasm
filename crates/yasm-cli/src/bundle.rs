@@ -10,7 +10,7 @@ use crate::{acquired_self_member_ids, skill_directory_diff, ScopeContext};
 
 /// Validated embedded skills, reused throughout one add or update operation.
 pub(crate) struct SelfBundle<'a> {
-    pub(crate) skills: BTreeMap<SkillId, &'a DiscoveredSkill>,
+    skills: BTreeMap<SkillId, &'a DiscoveredSkill>,
 }
 
 impl<'a> SelfBundle<'a> {
@@ -28,6 +28,10 @@ impl<'a> SelfBundle<'a> {
             anyhow::bail!("embedded self bundle manifest does not match its skill contents");
         }
         Ok(bundle)
+    }
+
+    pub(crate) fn skill(&self, skill_id: &SkillId) -> Option<&DiscoveredSkill> {
+        self.skills.get(skill_id).copied()
     }
 
     pub(crate) fn members(&self) -> BTreeSet<SkillId> {
@@ -123,4 +127,141 @@ pub(crate) fn bundle_member_enabled(
         }
     }
     enabled
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use camino::Utf8PathBuf;
+    use tempfile::TempDir;
+    use yasm_core::{
+        digest_skill_tree, discover_skills, AgentRegistry, LockFile, LockedSkillRecord, SkillId,
+        Store, YasmPaths,
+    };
+    use yasm_providers::SourceInput;
+
+    use crate::bundle::SelfBundle;
+    use crate::{ResolvedScope, ScopeContext};
+
+    struct Fixture {
+        _temp: TempDir,
+        context: ScopeContext,
+        skills: Vec<yasm_core::DiscoveredSkill>,
+        lock: LockFile,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+            let paths = YasmPaths {
+                data_dir: root.join("data"),
+                cache_dir: root.join("cache"),
+                config_dir: root.join("config"),
+            };
+            let context = ScopeContext {
+                scope: ResolvedScope::Project { root: root.clone() },
+                store: Store::new(paths.skills_dir()),
+                registry: AgentRegistry::with_home(root.clone()),
+                paths,
+            };
+            let source_root = root.join("source");
+            let mut lock = LockFile::default();
+            for name in ["first", "second"] {
+                let contents =
+                    format!("---\nname: {name}\ndescription: Test member\n---\n\n{name}\n");
+                let skill_id = SkillId::parse(name).unwrap();
+                for directory in [source_root.join(name), context.store.skill_dir(&skill_id)] {
+                    std::fs::create_dir_all(&directory).unwrap();
+                    std::fs::write(directory.join("SKILL.md"), &contents).unwrap();
+                }
+            }
+            let skills = discover_skills(&source_root).unwrap();
+            for skill in &skills {
+                lock.skills.insert(
+                    SkillId::parse(skill.name.as_str()).unwrap(),
+                    LockedSkillRecord {
+                        name: skill.name.clone(),
+                        source: SourceInput::Bundled.into_spec().unwrap(),
+                        resolved: None,
+                        skill_path: skill.skill_path.clone(),
+                        digest: digest_skill_tree(&skill.directory).unwrap(),
+                        enabled: BTreeSet::new(),
+                    },
+                );
+            }
+            Self {
+                _temp: temp,
+                context,
+                skills,
+                lock,
+            }
+        }
+
+        fn bundle(&self) -> SelfBundle<'_> {
+            // Synthetic membership exercises convergence independently of the singleton manifest.
+            SelfBundle {
+                skills: self
+                    .skills
+                    .iter()
+                    .map(|skill| (SkillId::parse(skill.name.as_str()).unwrap(), skill))
+                    .collect(),
+            }
+        }
+    }
+
+    #[test]
+    fn convergence_requires_every_member_to_be_installed_and_match() {
+        let mut fixture = Fixture::new();
+        let excluded = BTreeSet::new();
+        assert!(fixture
+            .bundle()
+            .is_converged(&fixture.context, &fixture.lock, &excluded)
+            .unwrap());
+
+        let second = SkillId::parse("second").unwrap();
+        std::fs::write(
+            fixture.context.store.skill_dir(&second).join("SKILL.md"),
+            "edited\n",
+        )
+        .unwrap();
+        assert!(!fixture
+            .bundle()
+            .is_converged(&fixture.context, &fixture.lock, &excluded)
+            .unwrap());
+
+        fixture.lock.skills.remove(&second);
+        std::fs::remove_dir_all(fixture.context.store.skill_dir(&second)).unwrap();
+        assert!(!fixture
+            .bundle()
+            .is_converged(&fixture.context, &fixture.lock, &excluded)
+            .unwrap());
+        // Add can compare a matching installed subset without claiming full convergence.
+        assert!(fixture
+            .bundle()
+            .matches_installed_contents(
+                &fixture.context,
+                &fixture.lock.skills.keys().cloned().collect()
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn excluded_members_must_be_absent_for_convergence() {
+        let mut fixture = Fixture::new();
+        let second = SkillId::parse("second").unwrap();
+        let excluded = BTreeSet::from([second.clone()]);
+        assert!(!fixture
+            .bundle()
+            .is_converged(&fixture.context, &fixture.lock, &excluded)
+            .unwrap());
+
+        fixture.lock.skills.remove(&second);
+        std::fs::remove_dir_all(fixture.context.store.skill_dir(&second)).unwrap();
+        assert!(fixture
+            .bundle()
+            .is_converged(&fixture.context, &fixture.lock, &excluded)
+            .unwrap());
+    }
 }
