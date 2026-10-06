@@ -57,6 +57,28 @@ pub(crate) fn require_no_pending(context: &ScopeContext) -> Result<()> {
     Ok(())
 }
 
+// Lock the store directory itself: canonical aliases share one lock and no
+// runtime lock file needs to be committed with a project store.
+struct MigrationLease(std::fs::File);
+
+impl MigrationLease {
+    fn acquire(context: &ScopeContext) -> Result<Self> {
+        std::fs::create_dir_all(&context.paths.data_dir)?;
+        let file = std::fs::File::open(&context.paths.data_dir)?;
+        file.try_lock().map_err(|error| anyhow::anyhow!(
+            "cannot lock agent-file migration scope; another migration may be active; retry after it finishes: {error}"
+        ))?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for MigrationLease {
+    fn drop(&mut self) {
+        // Release explicitly even if a concurrent fork inherited this descriptor.
+        let _ = self.0.unlock();
+    }
+}
+
 fn sources(context: &ScopeContext) -> Result<[Utf8PathBuf; 2]> {
     match &context.scope {
         ResolvedScope::Project { root } => Ok(NAMES.map(|name| root.join(name))),
@@ -83,6 +105,13 @@ fn sources(context: &ScopeContext) -> Result<[Utf8PathBuf; 2]> {
 
 pub(crate) fn migrate(context: &ScopeContext, requested: Option<MigrationAction>) -> Result<()> {
     let mut requested = requested;
+    // Acquire before reading the journal so an active migration cannot be
+    // mistaken for an interrupted one. Review never creates or locks files.
+    let mut lease = if requested == Some(MigrationAction::Apply) {
+        Some(MigrationLease::acquire(context)?)
+    } else {
+        None
+    };
     // Skill recovery must remain a separate operation, especially for read-only review.
     if present(&crate::migration_journal_path(context))? {
         anyhow::bail!("an interrupted skill migration must be recovered first; run `yasm migrate --action review`");
@@ -103,7 +132,12 @@ pub(crate) fn migrate(context: &ScopeContext, requested: Option<MigrationAction>
             println!("review only; pending migration was not changed");
             return Ok(());
         }
-        recover(context, &source_paths)?;
+        if lease.is_none() {
+            lease = Some(MigrationLease::acquire(context)?);
+        }
+        if present(&journal_path(context))? {
+            recover(context, &source_paths)?;
+        }
         requested = Some(MigrationAction::Apply);
     }
     let store = context.paths.data_dir.join("agent-files");
@@ -140,6 +174,13 @@ pub(crate) fn migrate(context: &ScopeContext, requested: Option<MigrationAction>
         println!("review only; no changes made");
         return Ok(());
     }
+    if lease.is_none() {
+        lease = Some(MigrationLease::acquire(context)?);
+        // Another apply may have run while the interactive choice was pending.
+        // Revalidate the plan below, and defer a newly pending journal to retry.
+        require_no_pending(context)?;
+    }
+    let _lease = lease;
     for candidate in &candidates {
         if let Disposition::Conflict(reason) = &candidate.disposition {
             anyhow::bail!(
@@ -258,7 +299,9 @@ pub(crate) fn migrate(context: &ScopeContext, requested: Option<MigrationAction>
     }
     recover(context, &source_paths)?;
     println!("migrated {} agent file(s)", selected.len());
-    crate::print_project_commit_hint(context);
+    if context.is_project() {
+        println!("Commit .yasm/agent-files/ and the root AGENTS.md / CLAUDE.md links so a clone can use them without Yasm.");
+    }
     Ok(())
 }
 
@@ -376,6 +419,14 @@ fn recover(context: &ScopeContext, sources: &[Utf8PathBuf; 2]) -> Result<()> {
                 && change.target == relative_path(&change.resolved_parent, &change.destination)?,
             "agent-file parent or journal target changed; backups preserved"
         );
+        if journal.committed {
+            // A committed transaction can retain its backup after interruption.
+            // Never discard the last copy if its stored destination disappeared;
+            // post-commit edits remain valid and need not match the old digest.
+            regular_contents(&change.destination).context(
+                "committed stored file is missing or unreadable; original backup preserved",
+            )?;
+        }
         if present(&backup(change))? {
             anyhow::ensure!(
                 digest(&regular_contents(&backup(change))?) == change.digest,
@@ -607,6 +658,67 @@ mod tests {
             .file_type()
             .is_symlink());
         assert!(!backup(change).exists());
+    }
+
+    #[test]
+    fn committed_agent_files_recovery_preserves_last_copy_when_store_disappears() {
+        let mut fixture = Fixture::new(true);
+        fixture.interrupt(3);
+        fixture.journal.committed = true;
+        write_journal(&fixture.context, &fixture.journal).unwrap();
+        let change = &fixture.journal.changes[0];
+        std::fs::remove_file(&change.destination).unwrap();
+
+        assert!(fixture.recover().is_err());
+        assert_eq!(std::fs::read(backup(change)).unwrap(), b"original");
+        assert!(journal_path(&fixture.context).exists());
+        assert!(std::fs::symlink_metadata(&change.source)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn concurrent_agent_files_apply_cannot_recover_an_active_migration() {
+        let fixture = Fixture::new(true);
+        let lease = crate::agent_files::MigrationLease::acquire(&fixture.context).unwrap();
+        fixture.interrupt(1);
+        let journal_before = std::fs::read(journal_path(&fixture.context)).unwrap();
+        let change = &fixture.journal.changes[0];
+
+        let error = migrate(&fixture.context, Some(MigrationAction::Apply)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("another migration may be active"));
+        assert_eq!(std::fs::read(&change.source).unwrap(), b"original");
+        assert_eq!(std::fs::read(&change.destination).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(journal_path(&fixture.context)).unwrap(),
+            journal_before
+        );
+        assert!(!backup(change).exists());
+
+        drop(lease);
+        migrate(&fixture.context, Some(MigrationAction::Apply)).unwrap();
+        assert_eq!(std::fs::read(&change.source).unwrap(), b"original");
+        assert!(!journal_path(&fixture.context).exists());
+    }
+
+    #[test]
+    fn agent_files_scope_lock_covers_aliases_and_releases_inherited_descriptors() {
+        let mut fixture = Fixture::new(true);
+        let lease = crate::agent_files::MigrationLease::acquire(&fixture.context).unwrap();
+        let inherited = lease.0.try_clone().unwrap();
+        let alias = fixture.journal.changes[0]
+            .resolved_parent
+            .join("store-alias");
+        std::os::unix::fs::symlink(&fixture.context.paths.data_dir, &alias).unwrap();
+        fixture.context.paths.data_dir = alias;
+        assert!(crate::agent_files::MigrationLease::acquire(&fixture.context).is_err());
+        drop(lease);
+        let next = crate::agent_files::MigrationLease::acquire(&fixture.context).unwrap();
+        drop(next);
+        drop(inherited);
     }
 
     #[test]

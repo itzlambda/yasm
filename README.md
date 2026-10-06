@@ -198,7 +198,10 @@ file links are calculated from the resolved parent directory.
 `--with-upstream`. Non-TTY usage requires `--action review` or `--action apply`;
 a terminal can prompt for either action.
 
-Migration journals changes and retains original-file backups until commit. After
+Apply operations hold a store lock so another process cannot recover an active
+migration. Migration journals changes and retains original-file backups until
+commit. Committed cleanup verifies that the stored files remain readable before
+deleting backups. After
 an interruption, review leaves recovery state untouched; run the same command
 with `--action apply`, the original scope, and the original `CODEX_HOME` to
 recover and retry. Recovery refuses to overwrite externally changed paths or
