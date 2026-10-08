@@ -9250,6 +9250,8 @@ fn update_selection_reviews_only_changed_skill_and_decline_preserves_receipt() {
     git(remote.path(), &["add", "."]);
     git(remote.path(), &["commit", "-m", "change retro"]);
     let mut command = repeated_add_command(data.path(), agents.path(), remote.path());
+    // Exercise review confirmation without waiting for an interactive diff pager.
+    command.env("PAGER", "cat");
     command.args(["update", "--action", "review"]);
     let TestCommand { command, _sandbox } = command;
     let mut session = Session::spawn(command).unwrap();
